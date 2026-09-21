@@ -1,0 +1,21 @@
+# Project-local environment, interpreters, tools and caches (see docs/LOCAL_SETUP.md).
+/.venv/
+/.cache/
+/.local/
+/.tmp/
+/.config/
+/.data/
+/.state/
+
+# Agent sandbox mount points.
+/.agents/
+/.codex/
+
+# Generated experiment outputs and datasets: large, reproducible, kept local.
+/artifacts/
+/datasets/
+
+# Python.
+__pycache__/
+*.py[cod]
+*.egg-info/

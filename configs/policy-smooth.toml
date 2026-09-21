@@ -1,0 +1,11 @@
+# Copyright (C) 2026 Florian Loitsch. All rights reserved.
+
+[runtime]
+device = "cuda"
+backend = "warp"
+physics_dt = 0.001
+control_dt = 0.010
+seed = 31
+world_count = 4
+scenario = "healthy"
+output = "artifacts"

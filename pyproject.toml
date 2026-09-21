@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "robot-ai"
+version = "0.1.0"
+description = "Adaptive control experiments for imperfect robots"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "numpy>=2.2,<3",
+  "scipy>=1.15,<2",
+  "torch==2.7.1",
+  "torchrl==0.7.2",
+  "tensordict==0.7.2",
+  "mujoco==3.3.2",
+  "warp-lang==1.7.2",
+  "pillow>=11,<13",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<9",
+  "ruff>=0.11,<1",
+]
+
+[project.scripts]
+robot-ai = "robot_ai.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/robot_ai"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "--cache-clear", "--basetemp=.tmp/pytest"]
+cache_dir = ".cache/pytest"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/robot_ai"]
+warn_unused_configs = true
+disable_error_code = ["import-untyped"]
+disallow_untyped_defs = true
+check_untyped_defs = true
+no_implicit_optional = true

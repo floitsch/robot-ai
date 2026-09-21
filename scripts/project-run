@@ -1,0 +1,57 @@
+#!/bin/sh
+# Copyright (C) 2026 Florian Loitsch. All rights reserved.
+set -eu
+
+SCRIPT_PATH=$0
+case "$SCRIPT_PATH" in
+  /*) ;;
+  *) SCRIPT_PATH=$(pwd)/$SCRIPT_PATH ;;
+esac
+ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)
+
+if [ "$#" -eq 0 ]; then
+  printf '%s\n' "usage: scripts/project-run COMMAND [ARGUMENT ...]" >&2
+  exit 2
+fi
+
+mkdir -p \
+  "$ROOT/.cache/uv" "$ROOT/.cache/pip" "$ROOT/.cache/torch" \
+  "$ROOT/.cache/torch-extensions" "$ROOT/.cache/torchinductor" \
+  "$ROOT/.cache/triton" "$ROOT/.cache/cuda" "$ROOT/.cache/warp" \
+  "$ROOT/.cache/matplotlib" "$ROOT/.cache/fontconfig" "$ROOT/.cache/python" \
+  "$ROOT/.cache/ruff" "$ROOT/.cache/mypy" "$ROOT/.cache/pytest" \
+  "$ROOT/.cache/xdg" "$ROOT/.config" "$ROOT/.data" "$ROOT/.state" "$ROOT/.tmp" \
+  "$ROOT/.local/bin" "$ROOT/.local/python" "$ROOT/.local/tools" \
+  "$ROOT/artifacts" "$ROOT/datasets"
+
+export ROBOT_AI_ROOT="$ROOT"
+export UV_CACHE_DIR="$ROOT/.cache/uv"
+export UV_PYTHON_INSTALL_DIR="$ROOT/.local/python"
+export UV_PYTHON_BIN_DIR="$ROOT/.local/bin"
+export UV_TOOL_DIR="$ROOT/.local/tools"
+export UV_TOOL_BIN_DIR="$ROOT/.local/bin"
+export UV_PROJECT_ENVIRONMENT="$ROOT/.venv"
+export UV_NO_MODIFY_PATH=1
+export PIP_CACHE_DIR="$ROOT/.cache/pip"
+export PYTHONNOUSERSITE=1
+export PYTHONPYCACHEPREFIX="$ROOT/.cache/python"
+export XDG_CACHE_HOME="$ROOT/.cache/xdg"
+export XDG_CONFIG_HOME="$ROOT/.config"
+export XDG_DATA_HOME="$ROOT/.data"
+export XDG_STATE_HOME="$ROOT/.state"
+export TMPDIR="$ROOT/.tmp"
+export TMP="$ROOT/.tmp"
+export TEMP="$ROOT/.tmp"
+export TORCH_HOME="$ROOT/.cache/torch"
+export TORCH_EXTENSIONS_DIR="$ROOT/.cache/torch-extensions"
+export TORCHINDUCTOR_CACHE_DIR="$ROOT/.cache/torchinductor"
+export TRITON_CACHE_DIR="$ROOT/.cache/triton"
+export CUDA_CACHE_PATH="$ROOT/.cache/cuda"
+export MPLCONFIGDIR="$ROOT/.cache/matplotlib"
+export RUFF_CACHE_DIR="$ROOT/.cache/ruff"
+export MYPY_CACHE_DIR="$ROOT/.cache/mypy"
+export PATH="$ROOT/.local/bin:$PATH"
+
+cd "$ROOT"
+exec "$@"
+

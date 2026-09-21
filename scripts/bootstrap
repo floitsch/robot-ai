@@ -1,0 +1,46 @@
+#!/bin/sh
+# Copyright (C) 2026 Florian Loitsch. All rights reserved.
+set -eu
+
+SCRIPT_PATH=$0
+case "$SCRIPT_PATH" in
+  /*) ;;
+  *) SCRIPT_PATH=$(pwd)/$SCRIPT_PATH ;;
+esac
+ROOT=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")/.." && pwd -P)
+RUNNER="$ROOT/scripts/project-run"
+
+if [ ! -x "$RUNNER" ]; then
+  printf '%s\n' "scripts/project-run must be executable" >&2
+  exit 1
+fi
+
+if command -v uv >/dev/null 2>&1; then
+  UV=$(command -v uv)
+else
+  UV_VERSION=${UV_VERSION:-0.8.17}
+  UV_ARCH=$(uname -m)
+  case "$UV_ARCH" in
+    x86_64) UV_ARCHIVE=uv-x86_64-unknown-linux-gnu.tar.gz; UV_DIR=uv-x86_64-unknown-linux-gnu ;;
+    aarch64|arm64) UV_ARCHIVE=uv-aarch64-unknown-linux-gnu.tar.gz; UV_DIR=uv-aarch64-unknown-linux-gnu ;;
+    *) printf '%s\n' "unsupported architecture for local uv bootstrap: $UV_ARCH" >&2; exit 1 ;;
+  esac
+  UV_TMP="$ROOT/.tmp/uv-bootstrap"
+  mkdir -p "$UV_TMP" "$ROOT/.local/bin"
+  curl --fail --location --retry 3 \
+    "https://github.com/astral-sh/uv/releases/download/$UV_VERSION/$UV_ARCHIVE" \
+    --output "$UV_TMP/$UV_ARCHIVE"
+  tar -xzf "$UV_TMP/$UV_ARCHIVE" -C "$UV_TMP"
+  cp "$UV_TMP/$UV_DIR/uv" "$ROOT/.local/bin/uv"
+  chmod 755 "$ROOT/.local/bin/uv"
+  UV="$ROOT/.local/bin/uv"
+fi
+
+"$RUNNER" "$UV" python install 3.12
+"$RUNNER" "$UV" venv --python 3.12 "$ROOT/.venv"
+"$RUNNER" "$UV" lock
+"$RUNNER" "$UV" sync --frozen
+
+printf '%s\n' "Bootstrap complete. Running the P0 doctor."
+"$RUNNER" "$UV" run robot-ai doctor --output artifacts/setup/doctor.json
+
