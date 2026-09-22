@@ -377,7 +377,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         if actor.insight is not None:
             record["insight_loss"] = insight_loss.item()
         if iteration % eval_every == 0 or iteration == iterations:
-            record["eval"] = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs)
+            record["eval"] = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs, severity=severity)
             torch.save(actor.state_dict(), output / "actor.pt")
         log.write(json.dumps(record) + "\n")
         log.flush()
@@ -477,7 +477,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
                                      "robot_ticks": iteration * worlds * ticks, "std": noise,
                                      "imitation_loss": imitation.item(), "rollout": rollout}
         if iteration % eval_every == 0 or iteration == iterations:
-            record["eval"] = evaluate(student.eval(), worlds=eval_worlds, device=device, limbs=limbs)
+            record["eval"] = evaluate(student.eval(), worlds=eval_worlds, device=device, limbs=limbs, severity=severity)
             student.train()
             torch.save(student.state_dict(), output / "actor.pt")
         log.write(json.dumps(record) + "\n")
