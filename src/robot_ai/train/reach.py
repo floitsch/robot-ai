@@ -387,7 +387,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
 def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations: int, seed: int,
             initial: Path | None = None, fine_scales: Sequence[float] = FINE_ERROR_SCALES, hidden: int = 64,
             insight_weight: float = 1.0, noise: float = 0.05, mixed: bool = False, pushes: bool = False, history: int = 0,
-            limbs: int = 0, per_limb: bool = False, message: int = 0, severity: float = 1.0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
+            limbs: int = 0, per_limb: bool = False, message: int = 0, severity: float = 1.0, teacher_drive: float = 0.0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
             learning_rate: float = 1e-3, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     """Teach a deployable recurrent actor to act like an oracle, using only what a real robot can sense.
 
@@ -437,6 +437,8 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
         with torch.no_grad():
             observation = env.reset()
             feeling, oracle_feeling = student.initial(worlds, dev), oracle.initial(worlds, dev)
+            share = max(0.0, 1.0 - (iteration - 1) / (teacher_drive * iterations)) if teacher_drive > 0 else 0.0
+            driven_by_teacher = torch.rand(worlds, device=dev) < share
             for tick in range(ticks):
                 if tick % chunk == 0:
                     feelings[tick // chunk] = feeling
@@ -445,7 +447,11 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
                 wanted, oracle_feeling = oracle(privileged[None], oracle_feeling)
                 targets[tick] = wanted[0].clamp(-1.0, 1.0)
                 mean, feeling = student(observation[None], feeling)
-                observation, _ = env.step(mean[0] + noise * torch.randn_like(mean[0]))
+                # DAgger mixing: early on the teacher drives some worlds, so the student first sees labels near the
+                # teacher's own trajectories; the share decays to zero over the first `teacher_drive` of training.
+                beta = max(0.0, 1.0 - (iteration - 1) / (teacher_drive * iterations)) if teacher_drive > 0 else 0.0
+                executed = torch.where(driven_by_teacher[:, None], targets[tick], mean[0]) if beta > 0 else mean[0]
+                observation, _ = env.step(executed + noise * torch.randn_like(mean[0]))
             rollout = _metrics(env.summary())
         for _ in range(epochs):
             order = torch.randperm(chunks * worlds, device=dev)
@@ -531,6 +537,8 @@ def main() -> None:
     teach = commands.add_parser("distill")
     teach.add_argument("--teacher", type=Path, required=True, help="oracle run directory, or `computed-torque`")
     teach.add_argument("--severity", type=float, default=1.0, help="0 = healthy robots, 1 = the full defect population")
+    teach.add_argument("--teacher-drive", type=float, default=0.0,
+                       help="fraction of training over which the teacher's share of driven worlds decays from 1 to 0 (DAgger)")
     teach.add_argument("--initial", type=Path, help="start the student from this run instead of from scratch")
     teach.add_argument("--output", type=Path, required=True)
     teach.add_argument("--iterations", type=int, default=200)
@@ -567,7 +575,7 @@ def main() -> None:
         distill(teacher=args.teacher, initial=args.initial, output=args.output, device=args.device, worlds=args.worlds,
                 iterations=args.iterations, hidden=args.hidden, seed=args.seed, mixed=args.mixed, pushes=args.pushes,
                 history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message, severity=args.severity,
-                minibatch=args.minibatch)
+                minibatch=args.minibatch, teacher_drive=args.teacher_drive)
     else:
         actors = {name: Path(path) for name, path in (item.split("=", 1) for item in args.actor)}
         print(json.dumps(report(actors, device=args.device, worlds=args.worlds, output=args.output), indent=2))

@@ -65,7 +65,7 @@ def minimum_jerk(phase: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 class ComputedTorqueTeacher(nn.Module):
     """Presents the oracle interface used by distillation, but reads the environment's truth directly."""
 
-    def __init__(self, env: ChainEnv, *, omega: float = 25.0, seconds_per_rad: float = 0.35) -> None:
+    def __init__(self, env: ChainEnv, *, omega: float = 15.0, seconds_per_rad: float = 0.5) -> None:
         super().__init__()
         self.env = env
         self.kp, self.kd = omega * omega, 2.0 * omega
