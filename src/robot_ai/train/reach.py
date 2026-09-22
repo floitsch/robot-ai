@@ -273,6 +273,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
           friction_probability: float = 0.7, oracle: int = 0, insight_weight: float = 0.0, mixed: bool = False,
           reward_tolerance: float = 0.03, pushes: bool = False, limbs: int = 0, roughness_weight: float | None = None,
           per_limb: bool = False, message: int = 0, severity: float = 1.0, initial: Path | None = None,
+          severity_ramp: int = 0,
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
@@ -323,6 +324,9 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
     for iteration in range(1, iterations + 1):
         for group in optimizer.param_groups:
             group["lr"] = learning_rate * (1.0 - 0.9 * (iteration - 1) / iterations)
+        if severity_ramp:
+            # Curriculum within the run: robots go from flawless to the target severity over the first `severity_ramp` iterations.
+            env.severity = severity * min(1.0, (iteration - 1) / severity_ramp)
         with torch.no_grad():
             observation = env.reset()
             feeling = actor.initial(worlds, dev)
@@ -530,6 +534,7 @@ def main() -> None:
     fit.add_argument("--limbs", type=int, default=0, help="train on a stacked chain of this many two-joint limbs")
     fit.add_argument("--severity", type=float, default=1.0, help="0 = healthy robots, 1 = the full defect population")
     fit.add_argument("--initial", type=Path, help="warm-start from this run (curriculum)")
+    fit.add_argument("--severity-ramp", type=int, default=0, help="ramp severity from 0 to --severity over this many iterations")
     fit.add_argument("--reward-tolerance", type=float, default=0.03,
                      help="train against a stricter tolerance than the 0.03 rad success criterion")
     fit.add_argument("--insight-weight", type=float, default=0.0,
@@ -581,7 +586,7 @@ def main() -> None:
               oracle={None: 0, "full": ORACLE_FULL, "condition": ORACLE_CONDITION}[args.oracle],
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
-              severity=args.severity, initial=args.initial, minibatch=args.minibatch,
+              severity=args.severity, initial=args.initial, minibatch=args.minibatch, severity_ramp=args.severity_ramp,
               output=args.output, device=args.device, worlds=args.worlds,
               iterations=args.iterations, seed=args.seed)
     elif args.command == "distill":
