@@ -387,7 +387,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
 def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations: int, seed: int,
             initial: Path | None = None, fine_scales: Sequence[float] = FINE_ERROR_SCALES, hidden: int = 64,
             insight_weight: float = 1.0, noise: float = 0.05, mixed: bool = False, pushes: bool = False, history: int = 0,
-            limbs: int = 0, per_limb: bool = False, message: int = 0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
+            limbs: int = 0, per_limb: bool = False, message: int = 0, severity: float = 1.0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
             learning_rate: float = 1e-3, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     """Teach a deployable recurrent actor to act like an oracle, using only what a real robot can sense.
 
@@ -396,9 +396,17 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
     """
 
     torch.manual_seed(seed)
-    env = make_env(worlds, device=device, seed=seed, limbs=limbs, mixed=mixed, pushes=pushes)
+    env = make_env(worlds, device=device, seed=seed, limbs=limbs, mixed=mixed, pushes=pushes, severity=severity)
     dev = env.torch_device
-    oracle = load_actor(teacher, dev)
+    if str(teacher) == "computed-torque":
+        # Classical teacher with perfect knowledge, reading the environment's truth directly.
+        from ..control.computed_torque import ComputedTorqueTeacher
+
+        if not isinstance(env, ChainEnv):
+            raise ValueError("the computed-torque teacher drives chains; use --limbs (1 for a single arm)")
+        oracle: Actor = ComputedTorqueTeacher(env).to(dev)  # type: ignore[assignment]
+    else:
+        oracle = load_actor(teacher, dev)
     if not oracle.oracle:
         raise ValueError("the teacher must be an oracle run")
     if oracle.n != getattr(env, "n", 2):
@@ -521,7 +529,8 @@ def main() -> None:
     fit.add_argument("--worlds", type=int, default=2048)
     fit.add_argument("--seed", type=int, default=1)
     teach = commands.add_parser("distill")
-    teach.add_argument("--teacher", type=Path, required=True, help="oracle run directory")
+    teach.add_argument("--teacher", type=Path, required=True, help="oracle run directory, or `computed-torque`")
+    teach.add_argument("--severity", type=float, default=1.0, help="0 = healthy robots, 1 = the full defect population")
     teach.add_argument("--initial", type=Path, help="start the student from this run instead of from scratch")
     teach.add_argument("--output", type=Path, required=True)
     teach.add_argument("--iterations", type=int, default=200)
@@ -556,7 +565,7 @@ def main() -> None:
     elif args.command == "distill":
         distill(teacher=args.teacher, initial=args.initial, output=args.output, device=args.device, worlds=args.worlds,
                 iterations=args.iterations, hidden=args.hidden, seed=args.seed, mixed=args.mixed, pushes=args.pushes,
-                history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message)
+                history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message, severity=args.severity)
     else:
         actors = {name: Path(path) for name, path in (item.split("=", 1) for item in args.actor)}
         print(json.dumps(report(actors, device=args.device, worlds=args.worlds, output=args.output), indent=2))
