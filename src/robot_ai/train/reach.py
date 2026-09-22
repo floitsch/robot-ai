@@ -272,22 +272,28 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
           fine_scales: Sequence[float] = (), hidden: int = 64, still_weight: float = 0.0,
           friction_probability: float = 0.7, oracle: int = 0, insight_weight: float = 0.0, mixed: bool = False,
           reward_tolerance: float = 0.03, pushes: bool = False, limbs: int = 0, roughness_weight: float | None = None,
-          per_limb: bool = False, message: int = 0,
+          per_limb: bool = False, message: int = 0, severity: float = 1.0, initial: Path | None = None,
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
     # Only explicitly set weights are passed on, so each task keeps its own defaults.
     weights = {k: v for k, v in (("still_weight", still_weight or None), ("roughness_weight", roughness_weight)) if v is not None}
     env = make_env(worlds, device=device, seed=seed, limbs=limbs, friction_probability=friction_probability, mixed=mixed,
-                   reward_tolerance=reward_tolerance, pushes=pushes, **weights)
+                   reward_tolerance=reward_tolerance, pushes=pushes, severity=severity, **weights)
     dev = env.torch_device
-    if per_limb:
+    actor: Actor
+    if initial:
+        # Curriculum: continue a policy trained under easier conditions, e.g. healthy robots before defective ones.
+        actor = load_actor(initial, dev).train()
+        if actor.n != getattr(env, "n", 2):
+            raise ValueError("the initial policy was trained for a different joint count")
+    elif per_limb:
         from .limbs import LimbPolicy
 
         if not limbs:
             raise ValueError("--per-limb needs --limbs")
-        actor: Actor = LimbPolicy(limbs=limbs, message=message, hidden=hidden, fine_scales=fine_scales, oracle=oracle,
-                                  initial_std=getattr(env, "initial_std", None)).to(dev)  # type: ignore[assignment]
+        actor = LimbPolicy(limbs=limbs, message=message, hidden=hidden, fine_scales=fine_scales, oracle=oracle,
+                           initial_std=getattr(env, "initial_std", None)).to(dev)  # type: ignore[assignment]
     else:
         actor = Actor(recurrent=recurrent, incremental=incremental, fine_scales=fine_scales, hidden=hidden, oracle=oracle,
                       insight=insight_weight > 0, joints=getattr(env, "n", 2), privileged_dim=env_privileged_dim(env),
@@ -498,6 +504,8 @@ def main() -> None:
                      help="also feed the goal error magnified and saturated at these scales (default scales if none given)")
     fit.add_argument("--hidden", type=int, default=64)
     fit.add_argument("--limbs", type=int, default=0, help="train on a stacked chain of this many two-joint limbs")
+    fit.add_argument("--severity", type=float, default=1.0, help="0 = healthy robots, 1 = the full defect population")
+    fit.add_argument("--initial", type=Path, help="warm-start from this run (curriculum)")
     fit.add_argument("--reward-tolerance", type=float, default=0.03,
                      help="train against a stricter tolerance than the 0.03 rad success criterion")
     fit.add_argument("--insight-weight", type=float, default=0.0,
@@ -542,6 +550,7 @@ def main() -> None:
               oracle={None: 0, "full": ORACLE_FULL, "condition": ORACLE_CONDITION}[args.oracle],
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
+              severity=args.severity, initial=args.initial,
               output=args.output, device=args.device, worlds=args.worlds,
               iterations=args.iterations, seed=args.seed)
     elif args.command == "distill":
