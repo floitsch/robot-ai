@@ -37,14 +37,14 @@ for the last 0.3 s of a 3 s episode with a goal change in the middle):
 
 | Arms | PID, gains tuned on these kinds of arms | **Our network** |
 | --- | --- | --- |
-| Healthy | 97.6% | **100%** |
-| Defective | 25% | **76%** |
-| Defective and changing mid-move | 22% | **74%** |
-| ... and shoved by a neighbour (never trained on) | 13% | **49%** |
+| Healthy | 97.6% | **99.8%** |
+| Defective | 25% | **82%** |
+| Defective and changing mid-move | 22% | **81%** |
+| ... and shoved by a neighbour (never trained on) | 13% | **52%** |
 
-On defective arms the network's typical final error is 8 mrad; the PID's is 142 mrad. The
-network also gets there about three times sooner. A well-tuned PID on a *healthy* arm is still
-more precise (1 mrad against 4 mrad), which is the current gap.
+On defective arms the network's typical final error is 6 mrad; the PID's is 142 mrad. The
+network also gets there about three times sooner. On a *healthy* arm it is as precise as the
+tuned PID (2 mrad against 1 mrad).
 
 See [docs/REACH.md](docs/REACH.md) for the method, the full result tables, what helped and what
 did not, and how to run everything.

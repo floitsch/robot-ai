@@ -58,12 +58,12 @@ grid-searched (432 settings) on defective robots. Oracles see hidden simulator t
 
 | Robots | Tuned PID | Memoryless net (PPO) | Recurrent net (PPO) | **Distilled student, 256 units** | Its oracle teacher |
 | --- | --- | --- | --- | --- | --- |
-| Healthy | 97.6% | 77.9% | 87.8% | **100%** | 80.0% |
-| Defective | 25.2% | 35.8% | 50.0% | **75.6%** | 89.4% |
-| Defective, changing mid-episode | 22.2% | 33.9% | 46.2% | **74.0%** | 86.5% |
-| ... and pushed by a neighbour (never trained on) | 12.6% | 26.1% | 32.1% | **49.0%** | 71.2% |
+| Healthy | 97.6% | 77.9% | 87.8% | **99.8%** | 99.9% |
+| Defective | 25.2% | 35.8% | 50.0% | **81.8%** | 95.0% |
+| Defective, changing mid-episode | 22.2% | 33.9% | 46.2% | **81.0%** | 93.4% |
+| ... and pushed by a neighbour (never trained on) | 12.6% | 26.1% | 32.1% | **51.8%** | 76.8% |
 
-Median final error on defective, changing robots: PID 142 mrad, student 8 mrad. The student also gets there
+Median final error on defective, changing robots: PID 142 mrad, student 6 mrad. The student also gets there
 about three times sooner (mean error over the episode 0.09 rad against 0.30 rad).
 
 Reproducibility: an earlier version of the student recipe (teacher trained against the plain 30 mrad
@@ -84,13 +84,16 @@ What mattered, in the order it was found:
 1. Feeding the goal error magnified (see above): 34% to 46% for PPO.
 2. Distilling from an oracle instead of training the deployable network by PPO alone: 49% to 55%.
 3. Student width, 64 to 256 units: 55% to 66%.
-4. Training the *teacher* against a stricter tolerance (15 mrad) than the 30 mrad success criterion. The first
-   oracle parked robots just outside tolerance; the stricter one reaches 86.5% and lifts its student to 74%
-   (600 distillation iterations; the last 300 added under one point).
+4. Training the *teacher* against a stricter tolerance than the 30 mrad success criterion, wider and longer.
+   The first oracle parked robots just outside tolerance. At 15 mrad (128 units, 400 iterations) it reaches
+   86.5% and its student 74%; at 10 mrad (192 units, 600 iterations) it reaches 93.4% and its student 81%.
+   The student tracks its teacher about 12 points below, so the teacher is the lever.
 
 What did not help: incremental (torque-change) commands (four times smoother, but ~28%), a stillness reward,
-a finer error magnification, training on low-friction populations, and a teacher that knows the robot's hidden
-condition but not its true state (the bottleneck is estimating the joint state through bad sensors, not
+a finer error magnification, training on low-friction populations, a window of the last four raw sensor
+readings as extra inputs (identical results: the student is not input-limited), training the student or the
+teacher with pushes (one to two points on the pushed set, several points lost elsewhere), and a teacher that
+knows the robot's hidden condition but not its true state (the bottleneck is estimating the joint state through bad sensors, not
 identifying the robot). Training on a population that runs from flawless to badly worn gives 1 mrad on healthy
 arms instead of 4 mrad, at the cost of 16 points on the hardest robots (57.6%).
 
@@ -101,13 +104,13 @@ See `artifacts/reach/comparison-best.html` (generated) for learning curves and s
 GPU work runs on the host through the project wrapper.
 
 ```sh
-# Oracle teacher by PPO (about an hour on a GTX 1650; two runs fit side by side in 4 GB).
-scripts/project-run .venv/bin/python -m robot_ai.train.reach train --fine-error --oracle full --hidden 128 \
-  --reward-tolerance 0.015 --iterations 400 --output artifacts/reach/oracle
+# Oracle teacher by PPO (about three hours on a GTX 1650; two runs fit side by side in 4 GB).
+scripts/project-run .venv/bin/python -m robot_ai.train.reach train --fine-error --oracle full --hidden 192 \
+  --reward-tolerance 0.01 --iterations 600 --output artifacts/reach/oracle
 
 # Deployable student by distillation (about an hour).
 scripts/project-run .venv/bin/python -m robot_ai.train.reach distill --teacher artifacts/reach/oracle --hidden 256 \
-  --iterations 600 --output artifacts/reach/recurrent
+  --iterations 400 --output artifacts/reach/recurrent
 
 # Memoryless PPO reference.
 scripts/project-run .venv/bin/python -m robot_ai.train.reach train --fine-error --memoryless --output artifacts/reach/memoryless

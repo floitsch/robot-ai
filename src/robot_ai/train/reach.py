@@ -214,12 +214,12 @@ def tune_pid(*, worlds: int, device: str) -> tuple[tuple[float, ...], dict[str, 
 def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations: int, seed: int, incremental: bool = False,
           fine_scales: Sequence[float] = (), hidden: int = 64, still_weight: float = 0.0,
           friction_probability: float = 0.7, oracle: int = 0, insight_weight: float = 0.0, mixed: bool = False,
-          reward_tolerance: float = 0.03,
+          reward_tolerance: float = 0.03, pushes: bool = False,
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
     env = ReachEnv(worlds, device=device, seed=seed, still_weight=still_weight, friction_probability=friction_probability,
-                   mixed=mixed, reward_tolerance=reward_tolerance)
+                   mixed=mixed, reward_tolerance=reward_tolerance, pushes=pushes)
     dev = env.torch_device
     actor = Actor(recurrent=recurrent, incremental=incremental, fine_scales=fine_scales, hidden=hidden, oracle=oracle,
                   insight=insight_weight > 0).to(dev)
@@ -436,9 +436,10 @@ def main() -> None:
     teach.add_argument("--hidden", type=int, default=64)
     teach.add_argument("--seed", type=int, default=1)
     teach.add_argument("--history", type=int, default=0, help="raw sensor readings from the last N ticks as extra inputs")
-    teach.add_argument("--pushes", action="store_true", help="train with neighbour pushes at full severity")
+
     for sub in (fit, teach):
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")
+        sub.add_argument("--pushes", action="store_true", help="train with neighbour pushes at full severity")
     compare = commands.add_parser("report")
     compare.add_argument("--actor", action="append", default=[], metavar="NAME=RUN_DIR")
     compare.add_argument("--output", type=Path, required=True)
@@ -451,6 +452,7 @@ def main() -> None:
               still_weight=args.still_weight, friction_probability=args.friction_probability,
               oracle={None: 0, "full": ORACLE_FULL, "condition": ORACLE_CONDITION}[args.oracle],
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
+              pushes=args.pushes,
               output=args.output, device=args.device, worlds=args.worlds,
               iterations=args.iterations, seed=args.seed)
     elif args.command == "distill":
