@@ -8,7 +8,7 @@ This project trains **one small neural network** that drives *any* such arm with
 anything about it. It gets the encoder readings, the motor current, and where you want the
 joints to go. From how the arm responds it works out, within a fraction of a second, what kind
 of arm it is holding: how slack, how sticky, how weak, how late. Then it drives it accordingly.
-Its memory is a vector of 256 numbers that we call the arm's **feeling**.
+Its memory is a vector of 384 numbers that we call the arm's **feeling**.
 
 ![Same broken arm, two controllers](docs/media/reach.gif)
 
@@ -37,14 +37,14 @@ for the last 0.3 s of a 3 s episode with a goal change in the middle):
 
 | Arms | PID, gains tuned on these kinds of arms | **Our network** |
 | --- | --- | --- |
-| Healthy | 97.6% | **99.8%** |
-| Defective | 25% | **82%** |
-| Defective and changing mid-move | 22% | **81%** |
+| Healthy | 97.6% | **98.4%** |
+| Defective | 25% | **83%** |
+| Defective and changing mid-move | 22% | **83%** |
 | ... and shoved by a neighbour (never trained on) | 13% | **52%** |
 
-On defective arms the network's typical final error is 6 mrad; the PID's is 142 mrad. The
-network also gets there about three times sooner. On a *healthy* arm it is as precise as the
-tuned PID (2 mrad against 1 mrad).
+On defective arms the network's typical final error is 2.4 mrad; the PID's is 142 mrad. The
+network also gets there about three times sooner. On a *healthy* arm it is exactly as precise as
+the tuned PID (1.0 mrad against 1.1 mrad).
 
 See [docs/REACH.md](docs/REACH.md) for the method, the full result tables, what helped and what
 did not, and how to run everything.
@@ -52,10 +52,11 @@ did not, and how to run everything.
 ## Using the controller
 
 The trained network is exported as **one C file that needs only `<math.h>`**: no framework, no
-allocation, about 400k parameters (1.6 MB as float32). Call it once per 10 ms control tick:
+allocation, about 900k parameters (3.6 MB of float32 weights, 13 MB as source). Call it once
+per 10 ms control tick:
 
 ```c
-float feeling[256] = {0};      /* the network's memory of this arm; zero once at power-up */
+float feeling[384] = {0};      /* the network's memory of this arm; zero once at power-up */
 float observation[12], command[2];
 /* observation: measured angle/pi (2), estimated velocity/5 rad/s (2), motor current as a
    fraction of rated torque (2), goal angle/pi (2), goal - measured angle in rad (2),

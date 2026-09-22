@@ -9,15 +9,25 @@ what a robot maker would compile into a motor controller.
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from ..sim.reach_env import COMMAND_RATE
 from ..train.reach import Actor, load_actor
 
 
+def _literal(value: np.float32) -> str:
+    """Shortest decimal that reads back as exactly this float32."""
+
+    text = np.format_float_positional(value, unique=True, trim="-") if 1e-4 <= abs(float(value)) < 1e6 or value == 0 else np.format_float_scientific(value, unique=True, trim="-")
+    if "e" not in text and "." not in text and "n" not in text:
+        text += ".0"
+    return text + "f"
+
+
 def _array(name: str, tensor: torch.Tensor) -> str:
-    values = tensor.detach().cpu().flatten().tolist()
-    body = ",\n  ".join(", ".join(f"{float(value)!r}f" for value in values[start:start + 8]) for start in range(0, len(values), 8))
+    values = tensor.detach().cpu().flatten().numpy().astype(np.float32)
+    body = ",\n  ".join(", ".join(_literal(value) for value in values[start:start + 8]) for start in range(0, len(values), 8))
     return f"static const float {name}[{len(values)}] = {{\n  {body}\n}};\n"
 
 

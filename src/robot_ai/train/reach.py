@@ -242,7 +242,7 @@ def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, **settings:
     """The single arm, or a stacked chain of `limbs` two-joint limbs when `limbs` is given."""
 
     if limbs:
-        allowed = {"severity", "changes", "reward_tolerance"}
+        allowed = {"severity", "changes", "reward_tolerance", "still_weight", "roughness_weight"}
         return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
     return ReachEnv(worlds, device=device, seed=seed, **settings)  # type: ignore[arg-type]
 

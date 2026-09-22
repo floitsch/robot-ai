@@ -93,10 +93,16 @@ class ChainEnv:
     """
 
     def __init__(self, worlds: int, limbs: int = 2, *, device: str = "cuda:0", seed: int = 0, severity: float = 1.0,
-                 episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE) -> None:
+                 episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
+                 still_weight: float = 1.0, roughness_weight: float = 4.0) -> None:
         self.worlds, self.limbs, self.n = worlds, limbs, limbs * JOINTS_PER_LIMB
         self.device, self.severity, self.episode_ticks, self.changes = device, severity, episode_ticks, changes
-        self.reward_tolerance = reward_tolerance
+        # A chain has a fast bending mode that a 100 Hz controller can excite; position error alone barely sees the
+        # resulting 0.01 rad chatter, so the reward also asks for rest directly.
+        self.reward_tolerance, self.still_weight = reward_tolerance, still_weight
+        # Through one tick of delay a chain admits a 50 Hz command limit cycle (sign flip every tick) that the arm's
+        # plant filtered out; a strong roughness penalty removes that local optimum.
+        self.roughness_weight = roughness_weight
         self.rng = np.random.default_rng([seed, limbs])
         self.torch_device = torch.device("cuda" if device.startswith("cuda") else "cpu")
         if self.torch_device.type == "cuda":
@@ -181,8 +187,11 @@ class ChainEnv:
         close = torch.exp(-error / self.reward_tolerance).mean(dim=1)
         # Same shape of reward as the arm, per joint pair so a longer chain is not penalized more per joint.
         scale = JOINTS_PER_LIMB / n
-        reward = 0.1 * (-error.sum(dim=1) * scale + close + arrived - 0.5 * rough * scale
+        reward = 0.1 * (-error.sum(dim=1) * scale + close + arrived - self.roughness_weight * rough * scale
                         - 0.002 * self._metrics[:, 0] / 0.01 * scale - limit * scale)
+        if self.still_weight:
+            reward = reward + 0.1 * self.still_weight * (close * torch.exp(-speed.amax(dim=1) / (2.0 * SETTLED_SPEED))
+                                                         - 0.2 * speed.mean(dim=1))
         self._previous = action
         self._sum_error += error.mean(dim=1)
         self._sum_rough += rough * scale
