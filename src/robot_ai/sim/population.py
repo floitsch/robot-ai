@@ -79,8 +79,28 @@ def sample_population(rng: np.random.Generator, worlds: int, *, severity: float 
     payload = np.where(rng.random(worlds) < 0.5, rng.uniform(0.0, 0.15, worlds), 0.0) * per_robot
     arms = _arm_array(lengths, masses, payload, gravity)
 
-    joints = _healthy_joints(worlds)
-    joints["torque_scale"] = NOMINAL_TORQUES * (1.0 - some(0.6, 0.0, 0.4))
+    return arms, sample_joint_defects(rng, worlds, JOINTS, NOMINAL_TORQUES, JOINT_LIMITS, severity=severity,
+                                       friction_probability=friction_probability, physics_dt=physics_dt)
+
+
+def sample_joint_defects(rng: np.random.Generator, worlds: int, joints_per_robot: int, nominal_torques: np.ndarray,
+                         limits: np.ndarray, *, severity: float | np.ndarray = 1.0, friction_probability: float = 0.7,
+                         physics_dt: float = 0.001) -> np.ndarray:
+    """Per-joint defects for `worlds` robots with `joints_per_robot` joints each; see `sample_population`."""
+
+    shape = (worlds, joints_per_robot)
+    severity = _per_world(np.asarray(severity, dtype=np.float64).reshape(-1) if np.ndim(severity) else severity, worlds)[1]
+
+    def some(probability: float, low: float, high: float) -> np.ndarray:
+        present = rng.random(shape) < probability
+        return np.where(present, rng.uniform(low, high, shape), 0.0) * severity
+
+    limits = np.broadcast_to(np.asarray(limits, dtype=np.float64), (joints_per_robot, 2))
+    joints = np.zeros(shape, dtype=JointParams.numpy_dtype())
+    joints["motor_alpha"], joints["bump0_width"], joints["bump1_width"] = 1.0, 0.1, 0.1
+    joints["mesh_stiffness"], joints["rotor_inertia"], joints["cur_gain"] = 100.0, 0.002, 1.0
+    joints["q_min"], joints["q_max"] = limits[:, 0], limits[:, 1]
+    joints["torque_scale"] = nominal_torques * (1.0 - some(0.6, 0.0, 0.4))
     time_constant = some(0.6, 0.002, 0.040)
     joints["motor_alpha"] = np.where(time_constant > 0, 1.0 - np.exp(-physics_dt / np.maximum(time_constant, 1e-9)), 1.0)
     joints["delay_steps"] = np.rint(some(0.5, 0.0, 0.030) / physics_dt).astype(np.int32)
@@ -89,7 +109,7 @@ def sample_population(rng: np.random.Generator, worlds: int, *, severity: float 
     joints["stribeck"] = some(0.5, 0.0, 0.6)
     for bump in ("bump0", "bump1"):
         joints[f"{bump}_mag"] = some(0.5 * friction_probability, 0.05, 0.40)
-        joints[f"{bump}_center"] = rng.uniform(JOINT_LIMITS[:, 0], JOINT_LIMITS[:, 1], shape)
+        joints[f"{bump}_center"] = rng.uniform(limits[:, 0], limits[:, 1], shape)
         joints[f"{bump}_width"] = rng.uniform(0.05, 0.25, shape)
     joints["half_gap"] = some(0.5, 0.002, 0.020)
     joints["mesh_stiffness"] = rng.uniform(60.0, 400.0, shape)
@@ -102,7 +122,7 @@ def sample_population(rng: np.random.Generator, worlds: int, *, severity: float 
     joints["cur_gain"] = 1.0 + severity * rng.uniform(-0.15, 0.15, shape)
     joints["cur_bias"] = severity * rng.uniform(-0.05, 0.05, shape)
     joints["cur_noise"] = some(0.8, 0.0, 0.05)
-    return arms, joints
+    return joints
 
 
 def sample_change(rng: np.random.Generator, arms: np.ndarray, joints: np.ndarray, *,

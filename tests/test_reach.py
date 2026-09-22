@@ -70,7 +70,8 @@ int main(void) {
   for (;;) {
     for (int i = 0; i < O; i++) if (scanf("%f", &observation[i]) != 1) return 0;
     reach_policy_step(observation, feeling, command);
-    printf("%.9g %.9g\\n", command[0], command[1]);
+    for (int k = 0; k < N; k++) printf("%.9g ", command[k]);
+    printf("\\n");
   }
 }
 """

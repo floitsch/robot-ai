@@ -57,6 +57,7 @@ src = ["src", "tests"]
 # In a Warp kernel `float(0.0)` declares a mutable variable; a bare literal is a constant.
 "src/robot_ai/sim/arm_batch.py" = ["UP018"]
 "src/robot_ai/sim/joint_model.py" = ["UP018"]
+"src/robot_ai/sim/chain_batch.py" = ["UP018"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -70,5 +71,5 @@ no_implicit_optional = true
 [[tool.mypy.overrides]]
 # Warp kernel signatures (`wp.array(dtype=...)`) are a DSL, not Python typing, and
 # NumPy's stubs cannot express the structured-array fields that mirror Warp structs.
-module = ["robot_ai.sim.arm_batch", "robot_ai.sim.joint_model", "robot_ai.sim.population"]
+module = ["robot_ai.sim.arm_batch", "robot_ai.sim.joint_model", "robot_ai.sim.population", "robot_ai.sim.chain_batch", "robot_ai.sim.chain_env"]
 ignore_errors = true

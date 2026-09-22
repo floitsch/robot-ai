@@ -22,16 +22,19 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
+from ..sim.chain_env import ChainEnv, ChainSummary
 from ..sim.population import NOMINAL_LENGTHS, NOMINAL_MASSES, NOMINAL_TORQUES
-from ..sim.reach_env import ERROR_SLICE, OBSERVATION_DIM, PRIVILEGED_DIM, EpisodeSummary, ReachEnv
+from ..sim.reach_env import PRIVILEGED_DIM, EpisodeSummary, ReachEnv
 
 EVAL_SEED = 987_654_321
 # A 30 mrad error is a 0.03 input among inputs of order one: too faint to steer by. Fine-error
 # actors also see it magnified and saturated at these scales, rad.
 FINE_ERROR_SCALES = (0.05, 0.5)
 ORACLE_FULL, ORACLE_CONDITION = 1, 2
-TRUE_STATE_DIM = 4  # true q and dq lead the privileged part of the input
-SENSOR_DIM = 6  # the raw sensor channels lead the observation: measured q, derived dq, motor current
+# Per joint: the observation holds 6 blocks (q, dq, current, goal, error, previous command); the privileged
+# part starts with true q and dq. The single arm has 2 joints; chains have more.
+OBSERVATION_BLOCKS = 6
+SENSOR_BLOCKS = 3  # measured q, derived dq, motor current lead the observation
 
 
 class PidController:
@@ -81,11 +84,20 @@ class Actor(nn.Module):
     fine_scales: Tensor
     oracle: Tensor
     history: Tensor
+    joints: Tensor
+    privileged_dim: Tensor
 
     def __init__(self, *, recurrent: bool, incremental: bool = False, fine_scales: Sequence[float] = (), hidden: int = 64,
-                 oracle: int = 0, insight: bool = False, history: int = 0) -> None:
+                 oracle: int = 0, insight: bool = False, history: int = 0, joints: int = 2,
+                 privileged_dim: int = PRIVILEGED_DIM) -> None:
         super().__init__()
         self.recurrent, self.hidden = recurrent, hidden
+        # The joint count fixes every input layout; the privileged width depends on the task's hidden fields.
+        self.register_buffer("joints", torch.tensor(joints))
+        self.register_buffer("privileged_dim", torch.tensor(privileged_dim))
+        self.n = joints
+        self.observation_dim = OBSERVATION_BLOCKS * joints
+        self.sensor_dim = SENSOR_BLOCKS * joints
         # The last `history` raw sensor readings ride along in the recurrent state, so delayed and noisy
         # encoders can be read as a short window rather than one sample at a time.
         self.register_buffer("history", torch.tensor(history))
@@ -96,7 +108,7 @@ class Actor(nn.Module):
         self.register_buffer("oracle", torch.tensor(int(oracle)))
         # Saved with the weights: the scales are part of what the encoder was trained to read.
         self.register_buffer("fine_scales", torch.tensor(list(fine_scales), dtype=torch.float32))
-        inputs = (PRIVILEGED_DIM if oracle else OBSERVATION_DIM) + 2 * len(fine_scales) + SENSOR_DIM * history
+        inputs = (privileged_dim if oracle else self.observation_dim) + joints * len(fine_scales) + self.sensor_dim * history
         # Incremental actors output command changes; saved with the weights so deployment cannot mix them up.
         self.register_buffer("incremental", torch.tensor(incremental))
         self.encoder = nn.Sequential(nn.Linear(inputs, hidden), nn.Tanh())
@@ -104,17 +116,17 @@ class Actor(nn.Module):
         # Training-only head: from the same features that drive the motors, name the true joint state and the
         # robot's hidden condition. It forces the feeling to filter noisy sensors and to identify the robot,
         # and it is the seed of a "this joint hurts" readout. Deployment ignores it.
-        self.insight = nn.Linear(hidden, PRIVILEGED_DIM - OBSERVATION_DIM) if insight else None
+        self.insight = nn.Linear(hidden, privileged_dim - self.observation_dim) if insight else None
         # Two command means and two log standard deviations: the policy explores boldly
         # while moving and can go quiet to hold still, which fixed noise never allows.
-        self.head = nn.Linear(hidden, 4)
+        self.head = nn.Linear(hidden, 2 * joints)
         nn.init.normal_(self.head.weight, std=0.01)
         with torch.no_grad():
-            self.head.bias.copy_(torch.tensor([0.0, 0.0, -0.7, -0.7]))
+            self.head.bias.copy_(torch.tensor([0.0] * joints + [-0.7] * joints))
 
     @property
     def state_dim(self) -> int:
-        return self.hidden + SENSOR_DIM * int(self.history)
+        return self.hidden + self.sensor_dim * int(self.history)
 
     def initial(self, worlds: int, device: torch.device) -> Tensor:
         return torch.zeros((worlds, self.state_dim), device=device)
@@ -128,20 +140,20 @@ class Actor(nn.Module):
     def distribution_and_features(self, observations: Tensor, feeling: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         if self.oracle == ORACLE_CONDITION:
             observations = observations.clone()
-            observations[..., OBSERVATION_DIM:OBSERVATION_DIM + TRUE_STATE_DIM] = 0.0
+            observations[..., self.observation_dim:self.observation_dim + 2 * self.n] = 0.0
         if len(self.fine_scales):
-            error = observations[..., ERROR_SLICE]
+            error = observations[..., 4 * self.n:5 * self.n]
             observations = torch.cat((observations, *(torch.tanh(error / scale) for scale in self.fine_scales)), dim=-1)
         hidden, window = feeling[:, :self.hidden], feeling[:, self.hidden:]
         if int(self.history):
             steps, worlds = observations.shape[:2]
             k = int(self.history)
-            raw = observations[..., :SENSOR_DIM]
-            padded = torch.cat((window.reshape(worlds, k, SENSOR_DIM).transpose(0, 1), raw))  # [k + steps, worlds, 6]
+            raw = observations[..., :self.sensor_dim]
+            padded = torch.cat((window.reshape(worlds, k, self.sensor_dim).transpose(0, 1), raw))  # [k + steps, worlds, sensors]
             index = torch.arange(steps, device=raw.device)[:, None] + torch.arange(k, device=raw.device)[None, :]
-            stacked = padded[index].permute(0, 2, 1, 3).reshape(steps, worlds, k * SENSOR_DIM)  # oldest first
+            stacked = padded[index].permute(0, 2, 1, 3).reshape(steps, worlds, k * self.sensor_dim)  # oldest first
             observations = torch.cat((observations, stacked), dim=-1)
-            window = padded[steps:].transpose(0, 1).reshape(worlds, k * SENSOR_DIM)
+            window = padded[steps:].transpose(0, 1).reshape(worlds, k * self.sensor_dim)
         encoded = self.encoder(observations)
         if self.recurrent:
             features, final = self.core(encoded, hidden[None].contiguous())
@@ -150,7 +162,7 @@ class Actor(nn.Module):
             features = self.core(encoded)
         feeling = torch.cat((hidden, window), dim=-1)
         output = self.head(features)
-        return output[..., :2], output[..., 2:].clamp(-4.0, 0.0).exp(), feeling, features
+        return output[..., :self.n], output[..., self.n:].clamp(-4.0, 0.0).exp(), feeling, features
 
     def forward(self, observations: Tensor, feeling: Tensor) -> tuple[Tensor, Tensor]:
         mean, _, feeling = self.distribution(observations, feeling)
@@ -164,27 +176,42 @@ def load_actor(run: Path, device: torch.device) -> Actor:
         state["fine_scales"] = torch.tensor(FINE_ERROR_SCALES if bool(state.pop("fine_error", False)) else ())
     state.setdefault("oracle", torch.tensor(False))
     state.setdefault("history", torch.tensor(0))
+    state.setdefault("joints", torch.tensor(2))
+    state.setdefault("privileged_dim", torch.tensor(PRIVILEGED_DIM))
     actor = Actor(recurrent="core.weight_ih_l0" in state, incremental=bool(state["incremental"]),
                   fine_scales=state["fine_scales"].tolist(), hidden=state["head.weight"].shape[1],
-                  oracle=int(state["oracle"]), insight="insight.weight" in state, history=int(state["history"])).to(device)
+                  oracle=int(state["oracle"]), insight="insight.weight" in state, history=int(state["history"]),
+                  joints=int(state["joints"]), privileged_dim=int(state["privileged_dim"])).to(device)
     actor.load_state_dict(state)
     return actor.eval()
 
 
-def make_critic() -> nn.Module:
-    return nn.Sequential(nn.Linear(PRIVILEGED_DIM, 128), nn.Tanh(), nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, 1))
+def env_privileged_dim(env: object) -> int:
+    return int(getattr(env, "privileged_dim", PRIVILEGED_DIM))
 
 
-def _metrics(summary: EpisodeSummary) -> dict[str, float]:
-    return {"success": summary.success.float().mean().item(), "final_error_mrad": 1000 * summary.final_error.median().item(),
-            "mean_error_rad": summary.mean_error.mean().item(), "roughness": summary.roughness.mean().item(),
-            "limit_time": summary.limit_time.mean().item(), "return": summary.episode_return.mean().item()}
+def make_critic(privileged_dim: int = PRIVILEGED_DIM) -> nn.Module:
+    return nn.Sequential(nn.Linear(privileged_dim, 128), nn.Tanh(), nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, 1))
+
+
+def _metrics(summary: EpisodeSummary | ChainSummary) -> dict[str, float]:
+    result = {"success": summary.success.float().mean().item(), "final_error_mrad": 1000 * summary.final_error.median().item(),
+              "mean_error_rad": summary.mean_error.mean().item(), "roughness": summary.roughness.mean().item(),
+              "return": summary.episode_return.mean().item()}
+    if isinstance(summary, EpisodeSummary):
+        result["limit_time"] = summary.limit_time.mean().item()
+    else:
+        for limb, value in enumerate(summary.limb_success.float().mean(dim=0).tolist()):
+            result[f"limb{limb}_success"] = value
+    return result
 
 
 @torch.no_grad()
 def evaluate(controller: PidController | Actor, *, worlds: int, device: str, severity: float = 1.0,
-             changes: bool = True, pushes: bool = False, seed: int = EVAL_SEED) -> dict[str, float]:
-    env = ReachEnv(worlds, device=device, seed=seed, severity=severity, changes=changes, pushes=pushes)
+             changes: bool = True, pushes: bool = False, seed: int = EVAL_SEED, limbs: int = 0) -> dict[str, float]:
+    if limbs == 0 and isinstance(controller, Actor) and controller.n != 2:
+        limbs = controller.n // 2
+    env = make_env(worlds, device=device, seed=seed, limbs=limbs, severity=severity, changes=changes, pushes=pushes)
     observation = env.reset()
     feeling = controller.initial(worlds, env.torch_device) if isinstance(controller, Actor) else None
     for _ in range(env.episode_ticks):
@@ -211,25 +238,34 @@ def tune_pid(*, worlds: int, device: str) -> tuple[tuple[float, ...], dict[str, 
     return best[1], best[2]
 
 
+def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, **settings: object) -> ReachEnv:
+    """The single arm, or a stacked chain of `limbs` two-joint limbs when `limbs` is given."""
+
+    if limbs:
+        allowed = {"severity", "changes", "reward_tolerance"}
+        return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
+    return ReachEnv(worlds, device=device, seed=seed, **settings)  # type: ignore[arg-type]
+
+
 def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations: int, seed: int, incremental: bool = False,
           fine_scales: Sequence[float] = (), hidden: int = 64, still_weight: float = 0.0,
           friction_probability: float = 0.7, oracle: int = 0, insight_weight: float = 0.0, mixed: bool = False,
-          reward_tolerance: float = 0.03, pushes: bool = False,
+          reward_tolerance: float = 0.03, pushes: bool = False, limbs: int = 0,
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
-    env = ReachEnv(worlds, device=device, seed=seed, still_weight=still_weight, friction_probability=friction_probability,
-                   mixed=mixed, reward_tolerance=reward_tolerance, pushes=pushes)
+    env = make_env(worlds, device=device, seed=seed, limbs=limbs, still_weight=still_weight,
+                   friction_probability=friction_probability, mixed=mixed, reward_tolerance=reward_tolerance, pushes=pushes)
     dev = env.torch_device
     actor = Actor(recurrent=recurrent, incremental=incremental, fine_scales=fine_scales, hidden=hidden, oracle=oracle,
-                  insight=insight_weight > 0).to(dev)
-    critic = make_critic().to(dev)
+                  insight=insight_weight > 0, joints=getattr(env, "n", 2), privileged_dim=env_privileged_dim(env)).to(dev)
+    critic = make_critic(env_privileged_dim(env)).to(dev)
     optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=learning_rate)
     ticks = env.episode_ticks
     chunks = ticks // chunk
-    observations = torch.zeros((ticks, worlds, PRIVILEGED_DIM if oracle else OBSERVATION_DIM), device=dev)
-    privileged = torch.zeros((ticks + 1, worlds, PRIVILEGED_DIM), device=dev)
-    actions = torch.zeros((ticks, worlds, 2), device=dev)
+    observations = torch.zeros((ticks, worlds, int(actor.privileged_dim) if oracle else actor.observation_dim), device=dev)
+    privileged = torch.zeros((ticks + 1, worlds, int(actor.privileged_dim)), device=dev)
+    actions = torch.zeros((ticks, worlds, actor.n), device=dev)
     log_probs, rewards = torch.zeros((ticks, worlds), device=dev), torch.zeros((ticks, worlds), device=dev)
     feelings = torch.zeros((chunks, worlds, actor.state_dim), device=dev)
     offsets = torch.arange(chunk, device=dev)[:, None]
@@ -284,7 +320,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
                 value_loss = (critic(privileged[time_index, world_grid]).squeeze(-1) - returns[time_index, world_grid]).square().mean()
                 loss = policy_loss + 0.5 * value_loss - entropy * policy.entropy().sum(dim=-1).mean()
                 if actor.insight is not None:
-                    truth = privileged[time_index, world_grid][..., OBSERVATION_DIM:]
+                    truth = privileged[time_index, world_grid][..., actor.observation_dim:]
                     insight_loss = (actor.insight(features) - truth).square().mean()
                     loss = loss + insight_weight * insight_loss
                 optimizer.zero_grad(set_to_none=True)
@@ -298,7 +334,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         if actor.insight is not None:
             record["insight_loss"] = insight_loss.item()
         if iteration % eval_every == 0 or iteration == iterations:
-            record["eval"] = evaluate(actor, worlds=eval_worlds, device=device)
+            record["eval"] = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs)
             torch.save(actor.state_dict(), output / "actor.pt")
         log.write(json.dumps(record) + "\n")
         log.flush()
@@ -307,7 +343,8 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
 
 def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations: int, seed: int,
             initial: Path | None = None, fine_scales: Sequence[float] = FINE_ERROR_SCALES, hidden: int = 64,
-            insight_weight: float = 1.0, noise: float = 0.05, mixed: bool = False, pushes: bool = False, history: int = 0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
+            insight_weight: float = 1.0, noise: float = 0.05, mixed: bool = False, pushes: bool = False, history: int = 0,
+            limbs: int = 0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
             learning_rate: float = 1e-3, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     """Teach a deployable recurrent actor to act like an oracle, using only what a real robot can sense.
 
@@ -316,19 +353,22 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
     """
 
     torch.manual_seed(seed)
-    env = ReachEnv(worlds, device=device, seed=seed, mixed=mixed, pushes=pushes)
+    env = make_env(worlds, device=device, seed=seed, limbs=limbs, mixed=mixed, pushes=pushes)
     dev = env.torch_device
     oracle = load_actor(teacher, dev)
     if not oracle.oracle:
         raise ValueError("the teacher must be an oracle run")
+    if oracle.n != getattr(env, "n", 2):
+        raise ValueError("the teacher was trained for a different joint count")
     student = load_actor(initial, dev).train() if initial else Actor(recurrent=True, fine_scales=fine_scales, hidden=hidden,
-                                                                       insight=insight_weight > 0, history=history).to(dev)
+                                                                       insight=insight_weight > 0, history=history,
+                                                                       joints=oracle.n, privileged_dim=int(oracle.privileged_dim)).to(dev)
     optimizer = torch.optim.Adam(student.parameters(), lr=learning_rate)
     ticks = env.episode_ticks
     chunks = ticks // chunk
-    observations = torch.zeros((ticks, worlds, OBSERVATION_DIM), device=dev)
-    truth = torch.zeros((ticks, worlds, PRIVILEGED_DIM - OBSERVATION_DIM), device=dev)
-    targets = torch.zeros((ticks, worlds, 2), device=dev)
+    observations = torch.zeros((ticks, worlds, student.observation_dim), device=dev)
+    truth = torch.zeros((ticks, worlds, int(student.privileged_dim) - student.observation_dim), device=dev)
+    targets = torch.zeros((ticks, worlds, student.n), device=dev)
     feelings = torch.zeros((chunks, worlds, student.state_dim), device=dev)
     offsets = torch.arange(chunk, device=dev)[:, None]
     output.mkdir(parents=True, exist_ok=True)
@@ -344,7 +384,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
                 if tick % chunk == 0:
                     feelings[tick // chunk] = feeling
                 privileged = env.privileged(observation)
-                observations[tick], truth[tick] = observation, privileged[:, OBSERVATION_DIM:]
+                observations[tick], truth[tick] = observation, privileged[:, student.observation_dim:]
                 wanted, oracle_feeling = oracle(privileged[None], oracle_feeling)
                 targets[tick] = wanted[0].clamp(-1.0, 1.0)
                 mean, feeling = student(observation[None], feeling)
@@ -372,7 +412,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
                                      "robot_ticks": iteration * worlds * ticks, "std": noise,
                                      "imitation_loss": imitation.item(), "rollout": rollout}
         if iteration % eval_every == 0 or iteration == iterations:
-            record["eval"] = evaluate(student.eval(), worlds=eval_worlds, device=device)
+            record["eval"] = evaluate(student.eval(), worlds=eval_worlds, device=device, limbs=limbs)
             student.train()
             torch.save(student.state_dict(), output / "actor.pt")
         log.write(json.dumps(record) + "\n")
@@ -414,6 +454,7 @@ def main() -> None:
     fit.add_argument("--fine-error", type=float, nargs="*", default=None, metavar="RAD",
                      help="also feed the goal error magnified and saturated at these scales (default scales if none given)")
     fit.add_argument("--hidden", type=int, default=64)
+    fit.add_argument("--limbs", type=int, default=0, help="train on a stacked chain of this many two-joint limbs")
     fit.add_argument("--reward-tolerance", type=float, default=0.03,
                      help="train against a stricter tolerance than the 0.03 rad success criterion")
     fit.add_argument("--insight-weight", type=float, default=0.0,
@@ -436,6 +477,7 @@ def main() -> None:
     teach.add_argument("--hidden", type=int, default=64)
     teach.add_argument("--seed", type=int, default=1)
     teach.add_argument("--history", type=int, default=0, help="raw sensor readings from the last N ticks as extra inputs")
+    teach.add_argument("--limbs", type=int, default=0, help="distill on a stacked chain of this many two-joint limbs")
 
     for sub in (fit, teach):
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")
@@ -452,13 +494,13 @@ def main() -> None:
               still_weight=args.still_weight, friction_probability=args.friction_probability,
               oracle={None: 0, "full": ORACLE_FULL, "condition": ORACLE_CONDITION}[args.oracle],
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
-              pushes=args.pushes,
+              pushes=args.pushes, limbs=args.limbs,
               output=args.output, device=args.device, worlds=args.worlds,
               iterations=args.iterations, seed=args.seed)
     elif args.command == "distill":
         distill(teacher=args.teacher, initial=args.initial, output=args.output, device=args.device, worlds=args.worlds,
                 iterations=args.iterations, hidden=args.hidden, seed=args.seed, mixed=args.mixed, pushes=args.pushes,
-                history=args.history)
+                history=args.history, limbs=args.limbs)
     else:
         actors = {name: Path(path) for name, path in (item.split("=", 1) for item in args.actor)}
         print(json.dumps(report(actors, device=args.device, worlds=args.worlds, output=args.output), indent=2))
