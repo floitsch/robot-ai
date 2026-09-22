@@ -39,6 +39,28 @@ B, C and D are distilled from an oracle trained on the chain, as before. If C is
 clearly above B, limbs sharing a feeling is worth building on; if B is already close to D, a chip
 per limb is enough and the message can be dropped.
 
+## What has been learned so far
+
+- A single four-joint policy trained by PPO from scratch on defective chains does not learn: it either falls into a
+  50 Hz command limit cycle (a sign flip every tick through one tick of delay, which the arm's plant filtered and
+  the chain's light upper links do not) or, with a stronger smoothness penalty, collapses its exploration and
+  barely moves. The same recipe on a one-limb chain trains better than the original arm oracle, so the simulator,
+  task and reward are sound; four coupled joints is the optimisation problem.
+- A per-limb policy without a message cannot control the chain, structurally: the upper limb's gravity load and
+  base motion depend on the lower limb's pose, which its own encoders never show.
+- Seeding works. A computed-torque controller with perfect knowledge (`control/computed_torque.py`; inverse
+  dynamics plus PD, memoryless, on measured state) scores 99.7% on healthy chains and 14% on defective ones. A
+  four-joint student distilled from it with DAgger mixing (`distill --teacher computed-torque
+  --teacher-memoryless --teacher-omega 12 --teacher-drive 0.4 --severity 0`) reaches 76% on healthy chains after
+  100 iterations. Stiff or ramped variants of the teacher were harder to imitate.
+- Two training bugs found on the way: exploration noise must be scaled per joint by rated torque, and the
+  smoothness penalty must be charged on the policy's mean command, not the noisy sample, or PPO is paid for
+  killing its own exploration. And one instrumentation bug: training-time evaluation used the defective
+  population for healthy-stage runs, which made several healthy-stage results look like failures.
+
+The curriculum now under test: healthy chains first (seeded by computed torque, or by PPO), then PPO on
+defective chains warm-started from that, then the per-limb comparison.
+
 ## Out of scope for now
 
 Legs and contact, obstacles, three-dimensional chains, and a real robot. The chain kernel is
