@@ -1,92 +1,107 @@
-# Adaptive robot control
+# One controller for many cheap, imperfect robot arms
 
-> **Current line of work:** [the adaptive reach controller](docs/REACH.md) — a fused GPU simulator of thousands of
-> different imperfect arms, and one recurrent network that drives them without being told anything about the robot.
-> Everything below this note describes the earlier imitation prototype and is kept for history.
+Cheap arms are hard to drive well. Gears have slack, joints stick at some angles, motors are
+weaker than rated, encoders are coarse and late, and everything changes when the arm picks
+something up. A PID tuned for one arm is wrong for the next one, and wrong again a year later.
 
-**Global goal: compute a reusable model that makes cheap, imperfect robots useful
-to drive.** The model should work around backlash, bending, rubbing/scratching
-friction, wear, weak motors, mounting movement, and imperfect sensing, while
-producing accurate, timely, smooth motion within motor and structural load limits.
+This project trains **one small neural network** that drives *any* such arm without being told
+anything about it. It gets the encoder readings, the motor current, and where you want the
+joints to go. From how the arm responds it works out, within a fraction of a second, what kind
+of arm it is holding: how slack, how sticky, how weak, how late. Then it drives it accordingly.
+Its memory is a vector of 256 numbers that we call the arm's **feeling**.
 
-Design and implementation plan for a robot controller that reaches a target by a
-deadline, using a learned internal state (the robot's **feeling**) to adapt to its
-body, actuators, and imperfect sensors. Among controllers that meet the positioning
-requirements, prefer smoother movement.
+![Same broken arm, two controllers](docs/media/reach.gif)
 
-The initial experiment is a two-joint arm moving in a vertical plane. The eventual
-deliverable is a downloadable inference bundle: observer, predictor, controller,
-normalization, and an explicit robot/sensor/command contract.
+*Six arms from a held-out test set that the network never trained on, each driven by a PID with
+carefully tuned gains (top) and by our network (bottom). The grey ghost is the pose the goal asks
+for; green numbers are within tolerance.*
 
-**Current state: C3d-K direct executed-teacher coverage candidate is fully packaged and audited.**
-It distills all 10,880 saved C3d-G deployment-feature/executed-command pairs through the frozen
-151-input/128-hidden shared-feeling interface. CUDA fitting completed the fixed 3,000 passes;
-post-review engineering equivalence passed all 64 update-1,500 cases. CPU-reference selection
-chose update 1,500 (64/64, zero hard limits), and the matched examined-200 result is 200/200
-versus the accepted C3c-5 baseline's 195/200, with every primary and physical-motion gate passing.
-Mean KE is .052486 versus .100670 J s; median slew is 18.1131 versus 41.1445. A fresh schema-4
-bundle retains measurement correction; its clean CPU causal-packet replay has zero feature/action
-difference on examined cases 0/39, and its exported-model-only CUDA replay matches the saved
-source CUDA actions exactly for development case 0. The prior strict CPU/CUDA dq audit is retained
-unchanged as historical evidence. C4a and other fit variants remain paused.
+## What it does today
 
-The `.004089/.027964` RMS/max fidelity result and unresolved broad transfer apply only to the
-historical four-case C3d-J diagnostic, not to C3d-K's completed broader healthy-motion evaluation.
-They do not establish a capacity limit. The earlier anchored and residual methods remain negative
-results. See the [J diagnostic](artifacts/p7/c3d-small-teacher-executability-20260913/learning-progress/report.json),
-the [C3d-K bundle](artifacts/p7/c3dk-executed-teacher-coverage-20260913/inference-bundle-cpu-reference/),
-and saved [examined case-0 before/after replay](artifacts/p7/c3dk-executed-teacher-coverage-20260913/learning-progress-cpu-reference/examined200-case0-before-after.html)
-and [case-39 replay](artifacts/p7/c3dk-executed-teacher-coverage-20260913/learning-progress-cpu-reference/examined200-case39-before-after.html).
+The arm is a two-joint planar arm in simulation, and the task is to reach commanded joint
+angles and hold them. The simulator is the interesting part: it models thousands of *different*
+arms at once, each with its own combination of
 
-Per-case tradeoffs remain: KE improves in 197/200 cases (worst increase .0001823 J s, case 50),
-return motion in 195/200 (worst increase .0124615 m, case 43), and overshoot in 189/200; three
-overshoot cases worsen (largest .006001 m, case 41). Candidate maximum overshoot/return are
-.011907/.095411 m versus baseline .112011/.630430 m. Slew is worse in 14 cases, and RMS joint load
-increases in 7/6 cases despite mean joint-load deltas of −.143966/−.040046 N m. The aggregate gates
-pass, but these figures do not support a universal cleaner-motion or zero-overshoot claim.
+- slack in the gears (backlash), with a hidden rotor that has to cross the gap before the joint moves;
+- dry friction that really sticks until the motor pushes hard enough, plus rubbing spots at particular angles;
+- motors that are weaker than rated, respond slowly, and receive commands late;
+- encoders with offset, noise, coarse steps, and delivery delay; a current sensor with its own errors;
+- a payload picked up mid-move, a motor fading, or a joint fouling while the arm is moving;
+- optionally, a neighbouring arm shoving it around.
 
-The accepted C3c-5 controller remains immutable as the confirmation-backed baseline: 61/64
-development, 195/200 examined, and 194/200 confirmation. C3d-K completes bounded healthy-motion
-acceptance against its already-examined healthy set; it makes no unseen-set or adaptation claim.
-C4a and other fitting variants are paused. Native coupled base and backlash reference work is
-recorded separately; it is not learned-controller acceptance.
+It runs on a consumer GPU at about a billion simulated robot-steps per second, so the network
+sees millions of different broken arms during training.
 
-Start with the [current guidance](docs/ROADMAP.md#current-guidance--learning-approach-reassessment)
-and [compact handoff](docs/STATUS.md). The C3d-K candidate bundle is reviewable; no further fit,
-confirmation access, or C4a expansion is active.
+**Results on 4,096 held-out arms** (success = every joint within 30 mrad of its goal and at rest
+for the last 0.3 s of a 3 s episode with a goal change in the middle):
 
-## Reading order
+| Arms | PID, gains tuned on these kinds of arms | **Our network** |
+| --- | --- | --- |
+| Healthy | 97.6% | **100%** |
+| Defective | 25% | **76%** |
+| Defective and changing mid-move | 22% | **74%** |
+| ... and shoved by a neighbour (never trained on) | 13% | **49%** |
 
-1. [Stack and decisions](docs/STACK.md): language, libraries, hardware, and tradeoffs.
-2. [Design guide](docs/DESIGN.md): architecture, interfaces, learning, and control.
-3. [Simulation specification](docs/SIMULATION.md): mechanics, sensors, faults, timing.
-4. [Evaluation contract](docs/EVALUATION.md): success, splits, benchmarks, and gates.
-5. [Implementation roadmap](docs/ROADMAP.md): ordered work packages and recovery plans.
-6. [Agent workflow](docs/AGENT_WORKFLOW.md): how to implement a bounded work package.
-7. [Progress ledger](docs/STATUS.md): current work, evidence, and unresolved decisions.
-8. [Local setup](docs/LOCAL_SETUP.md): keep every generated file/cache in this directory.
-9. [Visualization](docs/VISUALIZATION.md): inspect movement and learning progress.
+On defective arms the network's typical final error is 8 mrad; the PID's is 142 mrad. The
+network also gets there about three times sooner. A well-tuned PID on a *healthy* arm is still
+more precise (1 mrad against 4 mrad), which is the current gap.
 
-The installed implementation uses **Python 3.12, PyTorch, TorchRL, NVIDIA Warp,
-native MuJoCo, and uv**. The GPU rigid arm is a custom Warp kernel; MuJoCo Warp is
-the planned coupled-physics backend, not the current arm stepper. Start models and
-simulation on the GPU, subject to measured capacity; native MuJoCo supplies a CPU
-reference and explicit fallback. The GPU is accessible **outside the sandbox**.
-These libraries are design recommendations, not individually user-selected dependencies. See
-[the decision record](docs/STACK.md) before changing it.
+See [docs/REACH.md](docs/REACH.md) for the method, the full result tables, what helped and what
+did not, and how to run everything.
 
-The development machine was inspected on 2026-09-11: NVIDIA GeForce GTX 1650,
-4 GiB VRAM, driver 610.57.04; Intel i7-7700, four cores/eight threads. The plan
-must produce useful results on this machine. Larger training runs can later use
-the same configuration and artifact formats on another machine.
+## Using the controller
 
-Continue from the current recovery assignment in the roadmap and STATUS. Implement
-one bounded substep; preserve working components and historical artifacts.
+The trained network is exported as **one C file that needs only `<math.h>`**: no framework, no
+allocation, about 400k parameters (1.6 MB as float32). Call it once per 10 ms control tick:
 
-Visualization is a required deliverable: synchronized replays of untrained,
-intermediate, and final controllers with deadline/error plots. See
-[visualization](docs/VISUALIZATION.md).
+```c
+float feeling[256] = {0};      /* the network's memory of this arm; zero once at power-up */
+float observation[12], command[2];
+/* observation: measured angle/pi (2), estimated velocity/5 rad/s (2), motor current as a
+   fraction of rated torque (2), goal angle/pi (2), goal - measured angle in rad (2),
+   previous command (2) */
+reach_policy_step(observation, feeling, command);
+/* command: motor torque in [-1, 1] as a fraction of rated torque, per joint */
+```
 
-All setup and runtime writes stay inside this directory, including interpreters,
-environments, caches, temporary files, datasets, and reports. See
-[local setup](docs/LOCAL_SETUP.md).
+Nothing about the arm is configured. The exported file for the current network is generated by
+`python -m robot_ai.control.c_export`; `artifacts/` is not checked in, so run it yourself
+(see the docs) or ask for the file.
+
+Caveats worth knowing before trying it on hardware: it is trained for a two-joint arm in a
+vertical plane with torque-controlled motors and links of roughly 0.25 to 0.35 m and 0.3 to
+0.7 kg; position-servo arms would need a different command interface. It has not been on a real
+arm yet. The pushed condition (a neighbour moving the mount) is the weakest.
+
+## How it is trained, in one paragraph
+
+A first network is trained by reinforcement learning while being *told* the simulator's hidden
+truth (the arm's real joint state and every defect parameter). It cannot be deployed, but it
+learns what good control looks like on each kind of arm. A second network, which sees only what a
+real controller sees, then drives the arms itself while the first one, watching the hidden truth
+of the same moments, says what it would have done. The second network learns to reproduce that
+from sensors alone. Along the way it also has to predict the arm's true state and hidden defects
+from its own memory, which is what makes the memory a real "feeling" for the arm and, later, a
+maintenance signal ("joint 2 is getting stiff around 0.4 rad").
+
+## Repository
+
+| Path | What |
+| --- | --- |
+| `src/robot_ai/sim/joint_model.py`, `arm_batch.py` | The fused GPU simulator (NVIDIA Warp) |
+| `src/robot_ai/sim/population.py`, `reach_env.py` | Robot populations, mid-move changes, pushes; the reach task |
+| `src/robot_ai/train/reach.py` | Training (PPO oracle, distillation), the tuned PID, the comparison report |
+| `src/robot_ai/visualize/` | Comparison page, learning curves, animated replays |
+| `src/robot_ai/control/c_export.py` | Export to a single C file |
+| `docs/REACH.md` | Method, results, how to run |
+| `docs/PROTOTYPE_README.md` and the other docs | The earlier imitation prototype, kept for history |
+
+Setup and everything generated stay inside this directory; see [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
+More animations: `artifacts/reach/replays.html` (scrubbable replays) and `artifacts/reach/comparison-best.html`
+(learning curves, result tables, joint-angle traces) are generated by the commands in docs/REACH.md.
+The GPU used for all numbers above is a GeForce GTX 1650 (4 GB).
+
+## What comes next
+
+Closing the last gap to the oracle (better state estimation through bad sensors), pushes from
+neighbouring limbs, then more joints and, further out, several limbs sharing one feeling.

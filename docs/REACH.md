@@ -131,3 +131,11 @@ scripts/project-run .venv/bin/python -m robot_ai.control.c_export --run artifact
 Over the final 0.3 s of a 3 s episode every joint stays within 30 mrad of its goal,
 measured on the robot's own encoder scale, and moves slower than 0.1 rad/s.
 Evaluation uses 4,096 held-out robots that no controller trained or tuned on.
+
+## Animations
+
+```sh
+# Side-by-side replays (GIF for the README, HTML with a scrub bar) on six characteristic held-out arms.
+scripts/project-run .venv/bin/python -m robot_ai.visualize.animate --run artifacts/reach/recurrent \
+  --report artifacts/reach/report.json --gif docs/media/reach.gif --html artifacts/reach/replays.html
+```
