@@ -14,38 +14,54 @@ import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+from ..sim.chain_env import ChainEnv
 from ..sim.reach_env import TOLERANCE, ReachEnv
-from ..train.reach import EVAL_SEED, Actor, PidController, load_actor
+from ..train.reach import EVAL_SEED, PidController, load_actor
 from .reach import _pick_robots
 
 COLORS = {"pid": (42, 120, 214), "network": (27, 175, 122)}
 LABELS = {"pid": "Tuned PID", "network": "Our network (no configuration)"}
+CHAIN_LABELS = {"pid": "Computed torque (perfect knowledge)", "network": "Our network (no configuration)"}
 
 
 @torch.no_grad()
-def record_truth(controller: PidController | Actor, *, worlds: int, device: str, pushes: bool = False) -> tuple[ReachEnv, np.ndarray, np.ndarray]:
-    """True joint angles [ticks, worlds, 2] and goals in encoder units, on the held-out robots."""
+def record_truth(controller: object, *, worlds: int, device: str, pushes: bool = False, limbs: int = 0,
+                 severity: float = 1.0) -> tuple[ReachEnv | ChainEnv, np.ndarray, np.ndarray]:
+    """True joint angles [ticks, worlds, n] and goals in encoder units, on the held-out robots.
 
-    env = ReachEnv(worlds, device=device, seed=EVAL_SEED, pushes=pushes)
+    `controller` is a network, a PID (`act(env)`), or a factory `env -> network` for teachers that read the environment.
+    """
+
+    env: ReachEnv | ChainEnv
+    if limbs:
+        env = ChainEnv(worlds, limbs, device=device, seed=EVAL_SEED, severity=severity)
+    else:
+        env = ReachEnv(worlds, device=device, seed=EVAL_SEED, pushes=pushes, severity=severity)
     observation = env.reset()
-    feeling = controller.initial(worlds, env.torch_device) if isinstance(controller, torch.nn.Module) else None
+    if callable(controller) and not isinstance(controller, torch.nn.Module):
+        controller = controller(env)  # type: ignore[operator]
+    n = getattr(env, "n", 2)
+    feeling = controller.initial(worlds, env.torch_device) if isinstance(controller, torch.nn.Module) else None  # type: ignore[operator]
     truth, goals = [], []
     for _ in range(env.episode_ticks):
         if isinstance(controller, torch.nn.Module):
             mean, feeling = controller(observation[None], feeling)
-            action = env.integrate(mean[0]) if controller.incremental else mean[0]
+            action = env.integrate(mean[0]) if isinstance(env, ReachEnv) and bool(getattr(controller, "incremental", False)) else mean[0]
         else:
-            action = controller.act(env)
+            action = controller.act(env)  # type: ignore[attr-defined]
         goals.append(env.goal().cpu().numpy())
         observation, _ = env.step(action)
-        truth.append(env._truth[:, :2].cpu().numpy())
+        truth.append(env._truth[:, :n].cpu().numpy())
     return env, np.stack(truth), np.stack(goals)
 
 
-def _points(q: np.ndarray, lengths: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    elbow = np.stack((lengths[0] * np.sin(q[..., 0]), -lengths[0] * np.cos(q[..., 0])), axis=-1)
-    tip = elbow + np.stack((lengths[1] * np.sin(q[..., 0] + q[..., 1]), -lengths[1] * np.cos(q[..., 0] + q[..., 1])), axis=-1)
-    return elbow, tip
+def _points(q: np.ndarray, lengths: np.ndarray) -> list[np.ndarray]:
+    """Joint positions after each link, base excluded, for a planar chain of any length."""
+
+    theta = np.cumsum(q, axis=-1)
+    steps = np.stack((lengths * np.sin(theta), -lengths * np.cos(theta)), axis=-1)
+    positions = np.cumsum(steps, axis=-2)
+    return [positions[..., k, :] for k in range(lengths.shape[-1])]
 
 
 def _font(size: int) -> ImageFont.ImageFont | ImageFont.FreeTypeFont:
@@ -65,17 +81,49 @@ def _draw_arm(draw: ImageDraw.ImageDraw, origin: tuple[int, int], scale: float, 
         return origin[0] + scale * float(xy[0]), origin[1] - scale * float(xy[1])
 
     # The goal is given in encoder units; the arm that would satisfy it is at goal - bias in true angles.
-    ghost_elbow, ghost_tip = _points(goal_q - bias, lengths)
-    base, elbow, tip = pixel(np.zeros(2)), pixel(ghost_elbow), pixel(ghost_tip)
-    draw.line((base, elbow, tip), fill=(200, 200, 200), width=10, joint="curve")
+    base = pixel(np.zeros(2))
+    ghost = [base] + [pixel(point) for point in _points(goal_q - bias, lengths)]
+    draw.line(ghost, fill=(200, 200, 200), width=10, joint="curve")
+    tip = ghost[-1]
     draw.ellipse((tip[0] - 9, tip[1] - 9, tip[0] + 9, tip[1] + 9), outline=(120, 120, 120), width=2)
-    real_elbow, real_tip = _points(q, lengths)
-    elbow, tip = pixel(real_elbow), pixel(real_tip)
-    draw.line((base, elbow, tip), fill=color, width=14, joint="curve")
-    for point in (base, elbow):
+    real = [base] + [pixel(point) for point in _points(q, lengths)]
+    draw.line(real, fill=color, width=14, joint="curve")
+    for point in real[:-1]:
         draw.ellipse((point[0] - 6, point[1] - 6, point[0] + 6, point[1] + 6), fill=(40, 40, 40))
+    tip = real[-1]
     draw.ellipse((tip[0] - 5, tip[1] - 5, tip[0] + 5, tip[1] + 5), fill=(20, 20, 20))
     return float(np.abs(goal_q - (q + bias)).max())
+
+
+def _lengths(env: ReachEnv | ChainEnv, index: int) -> np.ndarray:
+    if isinstance(env, ChainEnv):
+        return np.asarray(env.links["length"][index], dtype=np.float64)
+    return np.array([env.arms["l1"][index], env.arms["l2"][index]])
+
+
+def _pick_chain_robots(env: ChainEnv) -> list[tuple[int, str]]:
+    from ..sim.chain_env import nominal_torques
+
+    joints = env.joints
+    dry = joints["coulomb"] * (1.0 + joints["stribeck"]) + joints["bump0_mag"] + joints["bump1_mag"]
+    weakness = 1.0 - joints["torque_scale"] / nominal_torques(env.limbs)
+    score = dry.sum(1) * 2 + joints["half_gap"].sum(1) * 40 + weakness.sum(1) * 2 + joints["delay_steps"].sum(1) / 30
+    changing = env.change_tick < env.episode_ticks
+
+    def fmt(values: np.ndarray, scale: float = 1.0, digits: int = 2) -> str:
+        return "/".join(f"{scale * v:.{digits}f}" for v in values)
+
+    def describe(index: int) -> str:
+        parts = [f"dry friction {fmt(dry[index])} N m", f"backlash {fmt(joints['half_gap'][index], 2000, 0)} mrad",
+                 f"motors at {fmt(100 - 100 * weakness[index], 1, 0)}%", f"command latency {fmt(joints['delay_steps'][index], 1, 0)} ms"]
+        if changing[index]:
+            parts.append(f"changes at {env.change_tick[index] / 100:.2f} s")
+        return "; ".join(parts)
+
+    picks = {"Nearly healthy": int(np.argmin(score)), "Sticky joints": int(np.argmax(dry.sum(1))),
+             "Slack gears": int(np.argmax(joints["half_gap"].sum(1))), "Weak motors": int(np.argmax(weakness.sum(1))),
+             "Changes mid-move": int(np.argmax(np.where(changing, score, -1.0))), "Everything at once": int(np.argmax(score))}
+    return [(index, f"{title} — {describe(index)}") for title, index in picks.items()]
 
 
 def render_gif(runs: dict[str, tuple[np.ndarray, np.ndarray]], env: ReachEnv, picks: list[tuple[int, str]], output: Path,
@@ -100,11 +148,13 @@ def render_gif(runs: dict[str, tuple[np.ndarray, np.ndarray]], env: ReachEnv, pi
             for line, word in enumerate(LABELS[name].split(" (")[0].split(" ")):
                 draw.text((10, top + panel // 2 - 20 + 16 * line), word, fill=COLORS[name], font=font)
             for column, (index, _) in enumerate(picks):
-                lengths = np.array([env.arms["l1"][index], env.arms["l2"][index]])
+                lengths = _lengths(env, index)
                 bias = env.joints["enc_bias"][index]
                 truth, goals = runs[name]
-                origin = (label_width + column * panel + panel // 2, top + panel // 2 - 24)
-                error = _draw_arm(draw, origin, panel * 0.72, truth[tick, index], goals[tick, index], lengths, COLORS[name], bias)
+                chain = lengths.size > 2
+                origin = (label_width + column * panel + panel // 2, top + panel // 2 - 24 + (30 if chain else 0))
+                error = _draw_arm(draw, origin, panel * (0.4 if chain else 0.72), truth[tick, index], goals[tick, index],
+                                  lengths, COLORS[name], bias)
                 ok = error < TOLERANCE
                 draw.text((label_width + column * panel + 8, top + panel + 2), f"{1000 * error:4.0f} mrad {'✓' if ok else ''}",
                           fill=(20, 130, 60) if ok else (150, 40, 40), font=small)
@@ -116,7 +166,7 @@ def render_gif(runs: dict[str, tuple[np.ndarray, np.ndarray]], env: ReachEnv, pi
 def render_html(runs: dict[str, tuple[np.ndarray, np.ndarray]], env: ReachEnv, picks: list[tuple[int, str]], output: Path) -> None:
     payload = {
         "controllers": [{"name": name, "label": LABELS[name], "color": "rgb({},{},{})".format(*COLORS[name])} for name in runs],
-        "robots": [{"title": title, "lengths": [float(env.arms["l1"][index]), float(env.arms["l2"][index])],
+        "robots": [{"title": title, "lengths": _lengths(env, index).tolist(),
                     "bias": env.joints["enc_bias"][index].tolist(),
                     "truth": {name: runs[name][0][:, index].round(4).tolist() for name in runs},
                     "goal": {name: runs[name][1][:, index].round(4).tolist() for name in runs}} for index, title in picks],
@@ -163,13 +213,24 @@ document.getElementById('play').onclick=function(){{playing=!playing;this.textCo
 
 
 def build(run: Path, gains: list[float], *, device: str, gif: Path | None, html_output: Path | None, worlds: int = 2048,
-          pushes: bool = False) -> list[tuple[int, str]]:
+          pushes: bool = False, limbs: int = 0, severity: float = 1.0) -> list[tuple[int, str]]:
     torch_device = torch.device("cuda" if device.startswith("cuda") else "cpu")
-    runs = {"pid": record_truth(PidController(gains, torch_device), worlds=worlds, device=device, pushes=pushes)[1:],
+    baseline: object
+    if limbs:
+        from ..control.computed_torque import ComputedTorqueTeacher
+
+        LABELS.update(CHAIN_LABELS)
+
+        def baseline(env: ChainEnv) -> ComputedTorqueTeacher:
+            return ComputedTorqueTeacher(env, omega=12.0, measured=True, ramp=False).to(torch_device)
+    else:
+        baseline = PidController(gains, torch_device)
+    runs = {"pid": record_truth(baseline, worlds=worlds, device=device, pushes=pushes, limbs=limbs, severity=severity)[1:],
             "network": None}
-    env, truth, goals = record_truth(load_actor(run, torch_device), worlds=worlds, device=device, pushes=pushes)
+    env, truth, goals = record_truth(load_actor(run, torch_device), worlds=worlds, device=device, pushes=pushes, limbs=limbs,
+                                     severity=severity)
     runs["network"] = (truth, goals)
-    picks = _pick_robots(env)
+    picks = _pick_chain_robots(env) if isinstance(env, ChainEnv) else _pick_robots(env)
     if gif is not None:
         render_gif(runs, env, picks, gif)  # type: ignore[arg-type]
     if html_output is not None:
@@ -180,14 +241,17 @@ def build(run: Path, gains: list[float], *, device: str, gif: Path | None, html_
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, required=True, help="student run directory")
-    parser.add_argument("--report", type=Path, required=True, help="report.json holding the tuned PID gains")
+    parser.add_argument("--report", type=Path, help="report.json holding the tuned PID gains (single arm only)")
     parser.add_argument("--gif", type=Path)
     parser.add_argument("--html", type=Path)
     parser.add_argument("--pushes", action="store_true")
+    parser.add_argument("--limbs", type=int, default=0, help="animate a stacked chain of this many two-joint limbs")
+    parser.add_argument("--severity", type=float, default=1.0)
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
-    gains = json.loads(args.report.read_text())["pid_gains"]
-    for index, title in build(args.run, gains, device=args.device, gif=args.gif, html_output=args.html, pushes=args.pushes):
+    gains = json.loads(args.report.read_text())["pid_gains"] if args.report else []
+    for index, title in build(args.run, gains, device=args.device, gif=args.gif, html_output=args.html, pushes=args.pushes,
+                              limbs=args.limbs, severity=args.severity):
         print(f"robot {index}: {html.unescape(title)}")
 
 
