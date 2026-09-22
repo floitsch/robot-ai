@@ -289,9 +289,12 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
             raise ValueError("the initial policy was trained for a different joint count")
         # A distilled policy never trained its exploration; start fine-tuning gently, scaled per joint by rated torque.
         stds = getattr(env, "initial_std", None) or [0.5] * actor.n
-        head = actor.actor.head if hasattr(actor, "actor") else actor.head
+        inner = getattr(actor, "actor", actor)
+        head = inner.head
+        assert isinstance(head, nn.Linear)
         with torch.no_grad():
-            head.bias[head.bias.shape[0] // 2:] = torch.log(torch.tensor(stds[:head.bias.shape[0] // 2], device=dev) * 0.3)
+            half = head.bias.shape[0] // 2
+            head.bias[half:] = torch.log(torch.tensor(stds[:half], device=dev) * 0.3)
     elif per_limb:
         from .limbs import LimbPolicy
 
