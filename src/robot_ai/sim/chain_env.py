@@ -109,6 +109,8 @@ class ChainEnv:
             wp.init()
             wp.set_stream(wp.stream_from_torch(torch.cuda.current_stream(self.torch_device)), device)
         self._torque = torch.as_tensor(nominal_torques(limbs), dtype=torch.float32, device=self.torch_device)
+        # Exploration noise as a fraction of rated torque, scaled so every joint gets the arm's absolute noise level.
+        self.initial_std = (0.5 * np.tile(NOMINAL_TORQUES, limbs) / nominal_torques(limbs)).tolist()
         self.observation_dim = 6 * self.n
         self.privileged_dim = self.observation_dim + 2 * self.n + 6 * self.n
 
@@ -143,6 +145,7 @@ class ChainEnv:
         self._metrics = wp.to_torch(self.batch.metrics)
         self.tick = 0
         self._previous = torch.zeros((self.worlds, self.n), device=self.torch_device)
+        self._previous_smooth = torch.zeros((self.worlds, self.n), device=self.torch_device)
         zeros = torch.zeros(self.worlds, device=self.torch_device)
         self._sum_error, self._sum_rough, self._return = zeros.clone(), zeros.clone(), zeros.clone()
         self._window_error = torch.zeros((self.worlds, self.n), device=self.torch_device)
@@ -174,14 +177,19 @@ class ChainEnv:
         hidden = torch.where((self.tick >= self._change_tick)[:, None], self._hidden_after, self._hidden_before)
         return torch.cat((observation, self._truth[:, :n] / torch.pi, self._truth[:, n:] / 5.0, hidden), dim=1)
 
-    def step(self, action: Tensor) -> tuple[Tensor, Tensor]:
+    def step(self, action: Tensor, reference: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        """`reference` is the policy's mean command when `action` is an exploration sample: roughness is charged
+        on the mean, so exploration noise is not punished and the policy is not pushed to stop exploring."""
+
         n = self.n
         action = action.clamp(-1.0, 1.0)
+        smooth = action if reference is None else reference.clamp(-1.0, 1.0)
         self.batch.step(action)
         self.tick += 1
         error = (self.goal() - (self._truth[:, :n] + self._bias)).abs()
         speed = self._truth[:, n:].abs()
-        rough = (action - self._previous).square().sum(dim=1)
+        rough = (smooth - self._previous_smooth).square().sum(dim=1)
+        self._previous_smooth = smooth
         limit = self._metrics[:, 2 + n:2 + 2 * n].sum(dim=1)
         arrived = ((error < self.reward_tolerance).all(dim=1) & (speed.amax(dim=1) < SETTLED_SPEED)).float()
         close = torch.exp(-error / self.reward_tolerance).mean(dim=1)

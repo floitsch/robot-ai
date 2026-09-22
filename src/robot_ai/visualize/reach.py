@@ -25,10 +25,10 @@ def record(controller: PidController | Actor, *, worlds: int, device: str) -> tu
 
     env = ReachEnv(worlds, device=device, seed=EVAL_SEED)
     observation = env.reset()
-    feeling = controller.initial(worlds, env.torch_device) if isinstance(controller, Actor) else None
+    feeling = controller.initial(worlds, env.torch_device) if isinstance(controller, torch.nn.Module) else None
     measured, goals = [], []
     for _ in range(env.episode_ticks):
-        if isinstance(controller, Actor):
+        if isinstance(controller, torch.nn.Module):
             mean, feeling = controller(observation[None], feeling)
             action = env.integrate(mean[0]) if controller.incremental else mean[0]
         else:
