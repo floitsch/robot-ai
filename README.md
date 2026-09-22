@@ -1,5 +1,9 @@
 # Adaptive robot control
 
+> **Current line of work:** [the adaptive reach controller](docs/REACH.md) — a fused GPU simulator of thousands of
+> different imperfect arms, and one recurrent network that drives them without being told anything about the robot.
+> Everything below this note describes the earlier imitation prototype and is kept for history.
+
 **Global goal: compute a reusable model that makes cheap, imperfect robots useful
 to drive.** The model should work around backlash, bending, rubbing/scratching
 friction, wear, weak motors, mounting movement, and imperfect sensing, while
