@@ -540,6 +540,7 @@ def main() -> None:
     teach.add_argument("--history", type=int, default=0, help="raw sensor readings from the last N ticks as extra inputs")
     teach.add_argument("--limbs", type=int, default=0, help="distill on a stacked chain of this many two-joint limbs")
     for sub in (fit, teach):
+        sub.add_argument("--minibatch", type=int, default=512, help="world-chunks per gradient step; halve it if the GPU runs out of memory")
         sub.add_argument("--per-limb", action="store_true", help="one shared two-joint policy per limb instead of one over all joints")
         sub.add_argument("--message", type=int, default=0, help="size of the message limbs exchange each tick (per-limb only)")
 
@@ -559,13 +560,14 @@ def main() -> None:
               oracle={None: 0, "full": ORACLE_FULL, "condition": ORACLE_CONDITION}[args.oracle],
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
-              severity=args.severity, initial=args.initial,
+              severity=args.severity, initial=args.initial, minibatch=args.minibatch,
               output=args.output, device=args.device, worlds=args.worlds,
               iterations=args.iterations, seed=args.seed)
     elif args.command == "distill":
         distill(teacher=args.teacher, initial=args.initial, output=args.output, device=args.device, worlds=args.worlds,
                 iterations=args.iterations, hidden=args.hidden, seed=args.seed, mixed=args.mixed, pushes=args.pushes,
-                history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message, severity=args.severity)
+                history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message, severity=args.severity,
+                minibatch=args.minibatch)
     else:
         actors = {name: Path(path) for name, path in (item.split("=", 1) for item in args.actor)}
         print(json.dumps(report(actors, device=args.device, worlds=args.worlds, output=args.output), indent=2))
