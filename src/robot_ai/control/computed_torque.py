@@ -65,11 +65,18 @@ def minimum_jerk(phase: Tensor) -> tuple[Tensor, Tensor, Tensor]:
 class ComputedTorqueTeacher(nn.Module):
     """Presents the oracle interface used by distillation, but reads the environment's truth directly."""
 
-    def __init__(self, env: ChainEnv, *, omega: float = 15.0, seconds_per_rad: float = 0.5) -> None:
+    def __init__(self, env: ChainEnv, *, omega: float = 15.0, seconds_per_rad: float = 0.5, measured: bool = False,
+                 ramp: bool = True) -> None:
         super().__init__()
         self.env = env
         self.kp, self.kd = omega * omega, 2.0 * omega
         self.seconds_per_rad = seconds_per_rad
+        # With `measured`, feedback uses the encoder angle and its lagged velocity estimate, as a student would, so the
+        # taught law is one that is stable on the student's own inputs; dynamics still use the true state and parameters.
+        self.measured = measured
+        # Without the ramp the law is memoryless (PD straight toward the goal): a pure function of the current state,
+        # which a student can imitate without reconstructing when the goal changed.
+        self.ramp = ramp
         self.n = env.n
         self.observation_dim = env.observation_dim
         self.privileged_dim = torch.tensor(env.privileged_dim)
@@ -102,6 +109,7 @@ class ComputedTorqueTeacher(nn.Module):
         q_true, dq_true = env._truth[:, :n], env._truth[:, n:]
         bias = env._bias
         q = q_true + bias  # the controller reasons in encoder units, where the goal is given
+        fb_q, fb_dq = (env.measured_q, env.velocity) if self.measured else (q, dq_true)
         seen, origin, elapsed, duration = feeling[:, :n], feeling[:, n:2 * n], feeling[:, 2 * n], feeling[:, 2 * n + 1]
         moved = (goal != seen).any(dim=1) | torch.isnan(seen).any(dim=1)
         origin = torch.where(moved[:, None], q, origin)
@@ -113,7 +121,9 @@ class ComputedTorqueTeacher(nn.Module):
         ref = origin + delta * pos[:, None]
         ref_v = delta * vel[:, None] / duration[:, None]
         ref_a = delta * acc[:, None] / duration[:, None] ** 2
-        desired = ref_a + self.kp * (ref - q) + self.kd * (ref_v - dq_true)
+        if not self.ramp:
+            ref, ref_v, ref_a = goal, torch.zeros_like(goal), torch.zeros_like(goal)
+        desired = ref_a + self.kp * (ref - fb_q) + self.kd * (ref_v - fb_dq)
         length, mass, com, inertia, torque_scale, damping = self._params(device)
         m, dyn_bias = chain_dynamics(q_true, dq_true, length, mass, com, inertia)
         torque = torch.einsum("wij,wj->wi", m, desired) + dyn_bias + damping * dq_true
