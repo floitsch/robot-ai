@@ -66,7 +66,7 @@ class ComputedTorqueTeacher(nn.Module):
     """Presents the oracle interface used by distillation, but reads the environment's truth directly."""
 
     def __init__(self, env: ChainEnv, *, omega: float = 15.0, seconds_per_rad: float = 0.5, measured: bool = False,
-                 ramp: bool = True) -> None:
+                 ramp: bool = True, friction: bool = False) -> None:
         super().__init__()
         self.env = env
         self.kp, self.kd = omega * omega, 2.0 * omega
@@ -77,6 +77,9 @@ class ComputedTorqueTeacher(nn.Module):
         # Without the ramp the law is memoryless (PD straight toward the goal): a pure function of the current state,
         # which a student can imitate without reconstructing when the goal changed.
         self.ramp = ramp
+        # Feed forward the known dry friction (Coulomb, breakaway bump and angle-local rubbing) against the intended
+        # direction of motion; the simulator's bound is the same expression as its `friction_bound`.
+        self.friction = friction
         self.n = env.n
         self.observation_dim = env.observation_dim
         self.privileged_dim = torch.tensor(env.privileged_dim)
@@ -101,6 +104,16 @@ class ComputedTorqueTeacher(nn.Module):
         return (pick(links["length"], clinks["length"]), pick(links["mass"], clinks["mass"]), pick(links["com"], clinks["com"]),
                 pick(links["inertia"], clinks["inertia"]), pick(joints["torque_scale"], cjoints["torque_scale"]),
                 pick(joints["damping"], cjoints["damping"]))
+
+    def _friction_bound(self, q: Tensor, dq: Tensor, device: torch.device) -> Tensor:
+        env = self.env
+        changed = torch.as_tensor(env.tick >= env.change_tick, device=device)[:, None]
+        j, cj = env.joints, env.changed[1]
+        field = lambda name: torch.where(changed, torch.as_tensor(cj[name], dtype=torch.float32, device=device),
+                                         torch.as_tensor(j[name], dtype=torch.float32, device=device))
+        rub = field("bump0_mag") * torch.exp(-0.5 * ((q - field("bump0_center")) / field("bump0_width")) ** 2)
+        rub = rub + field("bump1_mag") * torch.exp(-0.5 * ((q - field("bump1_center")) / field("bump1_width")) ** 2)
+        return field("coulomb") * (1.0 + field("stribeck") * torch.exp(-(dq / 0.05) ** 2)) + rub
 
     def forward(self, observations: Tensor, feeling: Tensor) -> tuple[Tensor, Tensor]:
         env, n = self.env, self.n
@@ -127,6 +140,9 @@ class ComputedTorqueTeacher(nn.Module):
         length, mass, com, inertia, torque_scale, damping = self._params(device)
         m, dyn_bias = chain_dynamics(q_true, dq_true, length, mass, com, inertia)
         torque = torch.einsum("wij,wj->wi", m, desired) + dyn_bias + damping * dq_true
+        if self.friction:
+            intent = torch.where(fb_dq.abs() > 0.05, fb_dq, (ref - fb_q) * 2.0)
+            torque = torque + self._friction_bound(q_true, dq_true, device) * torch.tanh(intent / 0.05)
         command = (torque / torque_scale).clamp(-1.0, 1.0)
         next_feeling = torch.cat((goal, origin, elapsed[:, None], duration[:, None]), dim=1)
         return command[None], next_feeling
