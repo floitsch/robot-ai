@@ -387,7 +387,8 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
 def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations: int, seed: int,
             initial: Path | None = None, fine_scales: Sequence[float] = FINE_ERROR_SCALES, hidden: int = 64,
             insight_weight: float = 1.0, noise: float = 0.05, mixed: bool = False, pushes: bool = False, history: int = 0,
-            limbs: int = 0, per_limb: bool = False, message: int = 0, severity: float = 1.0, teacher_drive: float = 0.0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
+            limbs: int = 0, per_limb: bool = False, message: int = 0, severity: float = 1.0, teacher_drive: float = 0.0,
+            teacher_omega: float = 15.0, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
             learning_rate: float = 1e-3, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     """Teach a deployable recurrent actor to act like an oracle, using only what a real robot can sense.
 
@@ -404,7 +405,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
 
         if not isinstance(env, ChainEnv):
             raise ValueError("the computed-torque teacher drives chains; use --limbs (1 for a single arm)")
-        oracle: Actor = ComputedTorqueTeacher(env).to(dev)  # type: ignore[assignment]
+        oracle: Actor = ComputedTorqueTeacher(env, omega=teacher_omega).to(dev)  # type: ignore[assignment]
     else:
         oracle = load_actor(teacher, dev)
     if not oracle.oracle:
@@ -537,6 +538,7 @@ def main() -> None:
     teach = commands.add_parser("distill")
     teach.add_argument("--teacher", type=Path, required=True, help="oracle run directory, or `computed-torque`")
     teach.add_argument("--severity", type=float, default=1.0, help="0 = healthy robots, 1 = the full defect population")
+    teach.add_argument("--teacher-omega", type=float, default=15.0, help="computed-torque teacher stiffness, rad/s")
     teach.add_argument("--teacher-drive", type=float, default=0.0,
                        help="fraction of training over which the teacher's share of driven worlds decays from 1 to 0 (DAgger)")
     teach.add_argument("--initial", type=Path, help="start the student from this run instead of from scratch")
@@ -575,7 +577,7 @@ def main() -> None:
         distill(teacher=args.teacher, initial=args.initial, output=args.output, device=args.device, worlds=args.worlds,
                 iterations=args.iterations, hidden=args.hidden, seed=args.seed, mixed=args.mixed, pushes=args.pushes,
                 history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message, severity=args.severity,
-                minibatch=args.minibatch, teacher_drive=args.teacher_drive)
+                minibatch=args.minibatch, teacher_drive=args.teacher_drive, teacher_omega=args.teacher_omega)
     else:
         actors = {name: Path(path) for name, path in (item.split("=", 1) for item in args.actor)}
         print(json.dumps(report(actors, device=args.device, worlds=args.worlds, output=args.output), indent=2))
