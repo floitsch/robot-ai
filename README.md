@@ -85,16 +85,50 @@ from sensors alone. Along the way it also has to predict the arm's true state an
 from its own memory, which is what makes the memory a real "feeling" for the arm and, later, a
 maintenance signal ("joint 2 is getting stiff around 0.4 rad").
 
+## Several limbs on top of each other (in progress, not solved)
+
+Mount a second arm on the tip of the first and the two stop being independent: the lower arm carries
+the upper one's weight and inertia, the upper one's gravity load depends on the lower one's pose, and
+whenever either moves the other's mount accelerates under it. That is the next thing this project is
+after, because it is what a real multi-limb machine does and because it is the honest test of whether
+a "feeling" can be shared between limbs.
+
+The simulator handles it: one kernel now does planar chains of any number of joints, validated
+against MuJoCo, with every per-joint defect as before. The control is not there yet. On a four-joint
+stacked chain the best network sits at about 90 mrad typical final error against the same 30 mrad
+criterion the single arm meets at 2.4 mrad. A classical controller *told* every true parameter of the
+robot manages 99.7% on healthy chains and 14% on defective ones, so the difficulty is real and not an
+artefact of the learning setup.
+
+Three things we have learned that are worth knowing before touching this:
+
+* Reinforcement learning from scratch does not get off the ground on the chain, though the identical
+  recipe works on a single arm. Seeding it with a classical controller does: that is what took the
+  healthy-chain network to 76%.
+* One network driving all four joints is much easier to train than one shared network per limb, even
+  when each limb is allowed to see the other's sensors (76% against 11% on healthy chains). What a
+  limb seems to need from its neighbour is not its measurements but its intent — where it is about to
+  go. Testing that properly is the next experiment.
+* Nothing fails because of one particular defect. Remove any single defect class and the chain result
+  barely moves; it is the *variety* across the population that the chain policy has not yet absorbed.
+
+[docs/MULTILIMB.md](docs/MULTILIMB.md) has the experiment design and the full list of what has been
+tried; [docs/HANDOVER.md](docs/HANDOVER.md) has the current state and what to do next.
+
 ## Repository
 
 | Path | What |
 | --- | --- |
-| `src/robot_ai/sim/joint_model.py`, `arm_batch.py` | The fused GPU simulator (NVIDIA Warp) |
+| `src/robot_ai/sim/joint_model.py`, `arm_batch.py` | The fused GPU simulator for two-joint arms (NVIDIA Warp) |
+| `src/robot_ai/sim/chain_batch.py`, `chain_env.py` | The same for planar chains of any length: stacked limbs |
 | `src/robot_ai/sim/population.py`, `reach_env.py` | Robot populations, mid-move changes, pushes; the reach task |
 | `src/robot_ai/train/reach.py` | Training (PPO oracle, distillation), the tuned PID, the comparison report |
+| `src/robot_ai/train/limbs.py` | One shared policy per limb, with optional sensing or messages between limbs |
+| `src/robot_ai/control/computed_torque.py` | Classical controller with perfect knowledge, used to seed chain learning |
 | `src/robot_ai/visualize/` | Comparison page, learning curves, animated replays |
 | `src/robot_ai/control/c_export.py` | Export to a single C file |
 | `docs/REACH.md` | Method, results, how to run |
+| `docs/MULTILIMB.md`, `docs/HANDOVER.md` | The stacked-limb experiment; the state of the work and next steps |
 | `docs/PROTOTYPE_README.md` and the other docs | The earlier imitation prototype, kept for history |
 
 Setup and everything generated stay inside this directory; see [docs/LOCAL_SETUP.md](docs/LOCAL_SETUP.md).
@@ -104,5 +138,6 @@ The GPU used for all numbers above is a GeForce GTX 1650 (4 GB).
 
 ## What comes next
 
-Closing the last gap to the oracle (better state estimation through bad sensors), pushes from
-neighbouring limbs, then more joints and, further out, several limbs sharing one feeling.
+Getting stacked limbs to the standard the single arm already meets, which needs a better teacher for
+the chain rather than more training. After that: limbs that tell each other where they are going,
+more joints per limb, and eventually a real arm.
