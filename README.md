@@ -47,7 +47,8 @@ network also gets there about three times sooner. On a *healthy* arm it is exact
 the tuned PID (1.0 mrad against 1.1 mrad).
 
 See [docs/REACH.md](docs/REACH.md) for the method, the full result tables, what helped and what
-did not, and how to run everything.
+did not, and how to run everything; [docs/HANDOVER.md](docs/HANDOVER.md) for the state of the work,
+the open multi-limb phase, and what to try next.
 
 ## Using the controller
 
