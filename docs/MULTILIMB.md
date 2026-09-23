@@ -67,8 +67,18 @@ per limb is enough and the message can be dropped.
   iterations the policy is at 167 mrad median on the full defective population (from 946 at the start), still
   improving but far from the 30 mrad criterion; 1,200-iteration continuations are running.
 
-The curriculum now under test: healthy chains first (seeded by computed torque), then PPO on defective chains
-warm-started from that, then the per-limb comparison.
+- The monolithic policy plateaus around 100 mrad median on the full defective population after warm-started PPO
+  (about 1,000 iterations); a widened oracle with privileged inputs plateaus at the same place, and a wider
+  reward tolerance makes it worse. The failure is stillness at the two coupling joints, not torque or information.
+- Per-limb policies imitate the computed-torque teacher far worse than the monolithic one on healthy chains:
+  11% with shared sensing (`--peek`, each limb sees the other's raw sensors) against 76% monolithic, and no
+  better with a limb-identity input. On a stacked chain, one controller over all joints is much easier to train
+  than a shared controller per limb, even when the limbs can see each other; what the per-limb form is missing is
+  the other limb's *intent* (its goal and coming motion), which a learned message could carry but which is slow
+  to train in the current tick-by-tick implementation.
+
+Where this leaves the design: the shared-feeling experiment (B, C, D) has a clear D and a weak B/C; a fair C needs
+a fast message implementation. The monolithic chain controller needs a new idea for stillness at the coupling.
 
 ## Out of scope for now
 
