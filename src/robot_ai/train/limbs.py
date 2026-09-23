@@ -34,12 +34,18 @@ class LimbPolicy(nn.Module):
     limbs: Tensor
     message_dim: Tensor
     peek: Tensor
+    identity: Tensor
 
     def __init__(self, *, limbs: int, message: int = 0, hidden: int = 64, fine_scales: Sequence[float] = (),
-                 oracle: int = 0, initial_std: Sequence[float] | None = None, peek: bool = False) -> None:
+                 oracle: int = 0, initial_std: Sequence[float] | None = None, peek: bool = False,
+                 identity: bool = False) -> None:
         super().__init__()
         self.register_buffer("limbs", torch.tensor(limbs))
         self.register_buffer("message_dim", torch.tensor(message))
+        # With `identity`, each copy is told its slot in the chain (one-hot): the lower limb carries everything and is
+        # rated stronger, so the same weights must play different roles.
+        self.register_buffer("identity", torch.tensor(identity))
+        self.identifying = identity
         # With `peek`, every limb also sees the other limbs' raw sensor readings (angles, velocities, currents) at the
         # same tick: shared sensing rather than a learned message, fully batched and one tick fresher.
         self.register_buffer("peek", torch.tensor(peek))
@@ -50,7 +56,8 @@ class LimbPolicy(nn.Module):
         per_limb_std = None if initial_std is None else list(initial_std)[:JOINTS_PER_LIMB]
         self.actor = Actor(recurrent=True, fine_scales=fine_scales, hidden=hidden, oracle=oracle, joints=JOINTS_PER_LIMB,
                            privileged_dim=PRIVILEGED_BLOCKS * JOINTS_PER_LIMB, initial_std=per_limb_std,
-                           extra_inputs=message * (limbs - 1) + (SENSOR_BLOCKS * JOINTS_PER_LIMB * (limbs - 1) if peek else 0),
+                           extra_inputs=message * (limbs - 1) + (SENSOR_BLOCKS * JOINTS_PER_LIMB * (limbs - 1) if peek else 0)
+                           + (limbs if identity else 0),
                            message=message)
         self.oracle, self.incremental, self.insight, self.hidden = self.actor.oracle, self.actor.incremental, None, hidden
 
@@ -79,6 +86,9 @@ class LimbPolicy(nn.Module):
             sensors = [limb_slices(observations, SENSOR_BLOCKS, self.count, limb) for limb in range(self.count)]
             per_limb = [torch.cat((per_limb[limb], *(sensors[o] for o in range(self.count) if o != limb)), dim=-1)
                         for limb in range(self.count)]
+        if self.identifying:
+            eye = torch.eye(self.count, device=observations.device)
+            per_limb = [torch.cat((per_limb[limb], eye[limb].expand(steps, worlds, self.count)), dim=-1) for limb in range(self.count)]
         states, messages = self._split(feeling)
         if self.msg == 0:
             # No coupling: every limb is an independent sequence, so run them all through the GRU at once.
