@@ -93,6 +93,13 @@ whenever either moves the other's mount accelerates under it. That is the next t
 after, because it is what a real multi-limb machine does and because it is the honest test of whether
 a "feeling" can be shared between limbs.
 
+![Two limbs stacked, four joints](docs/media/chain.gif)
+
+*The same six defective robots as above, but with a second arm mounted on the first. Computed torque
+(top) is a classical controller that is **told** every true parameter of the robot; our network
+(bottom) is told nothing. The network is several times closer to the goal, and still outside the
+30 mrad tolerance — the numbers stay red where the single-arm ones went green.*
+
 The simulator handles it: one kernel now does planar chains of any number of joints, validated
 against MuJoCo, with every per-joint defect as before. The control is not there yet. On a four-joint
 stacked chain the best network sits at about 90 mrad typical final error against the same 30 mrad

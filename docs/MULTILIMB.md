@@ -84,3 +84,13 @@ a fast message implementation. The monolithic chain controller needs a new idea 
 
 Legs and contact, obstacles, three-dimensional chains, and a real robot. The chain kernel is
 written for any N, so a three- or five-joint arm falls out of it for later.
+
+## Animations
+
+```sh
+# The current chain policy beside the computed-torque baseline, on six characteristic held-out chains.
+scripts/project-run .venv/bin/python -m robot_ai.visualize.animate --run artifacts/reach/chain-slowramp \
+  --limbs 2 --severity 1.0 --gif docs/media/chain.gif --html artifacts/reach/chain-replays.html
+```
+
+`--severity 0` shows healthy chains instead, where the seeded policy reaches 76%.
