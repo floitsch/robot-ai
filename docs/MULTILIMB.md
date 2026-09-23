@@ -58,8 +58,17 @@ per limb is enough and the message can be dropped.
   killing its own exploration. And one instrumentation bug: training-time evaluation used the defective
   population for healthy-stage runs, which made several healthy-stage results look like failures.
 
-The curriculum now under test: healthy chains first (seeded by computed torque, or by PPO), then PPO on
-defective chains warm-started from that, then the per-limb comparison.
+- PPO on healthy chains from scratch does not learn either (0% after 50 iterations, exploration collapsing), where
+  the computed-torque seed reaches 76%: seeding with a good algorithm is what unlocked the chain.
+- The computed-torque teacher cannot be extended to defective chains cheaply: feeding forward the known friction
+  changes nothing, because the command and encoder delays make any stiff model-based law chatter. So the second
+  stage is PPO, warm-started from the healthy-chain student with gentle exploration (its untrained exploration
+  head had to be reset; at 0.5 on an 18 N m joint it wrecked the warm start) and a severity ramp. After 400
+  iterations the policy is at 167 mrad median on the full defective population (from 946 at the start), still
+  improving but far from the 30 mrad criterion; 1,200-iteration continuations are running.
+
+The curriculum now under test: healthy chains first (seeded by computed torque), then PPO on defective chains
+warm-started from that, then the per-limb comparison.
 
 ## Out of scope for now
 
