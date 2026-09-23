@@ -12,7 +12,7 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 
-from .reach import OBSERVATION_BLOCKS, Actor
+from .reach import OBSERVATION_BLOCKS, SENSOR_BLOCKS, Actor
 
 JOINTS_PER_LIMB = 2
 # Per joint, the chain's privileged vector holds the 6 observation blocks, true q, true dq, then 6 hidden fields.
@@ -33,20 +33,25 @@ class LimbPolicy(nn.Module):
 
     limbs: Tensor
     message_dim: Tensor
+    peek: Tensor
 
     def __init__(self, *, limbs: int, message: int = 0, hidden: int = 64, fine_scales: Sequence[float] = (),
-                 oracle: int = 0, initial_std: Sequence[float] | None = None) -> None:
+                 oracle: int = 0, initial_std: Sequence[float] | None = None, peek: bool = False) -> None:
         super().__init__()
         self.register_buffer("limbs", torch.tensor(limbs))
         self.register_buffer("message_dim", torch.tensor(message))
-        self.count, self.msg = limbs, message
+        # With `peek`, every limb also sees the other limbs' raw sensor readings (angles, velocities, currents) at the
+        # same tick: shared sensing rather than a learned message, fully batched and one tick fresher.
+        self.register_buffer("peek", torch.tensor(peek))
+        self.count, self.msg, self.peeking = limbs, message, peek
         self.n = limbs * JOINTS_PER_LIMB
         self.observation_dim = OBSERVATION_BLOCKS * self.n
         self.privileged_dim = torch.tensor(PRIVILEGED_BLOCKS * self.n)
         per_limb_std = None if initial_std is None else list(initial_std)[:JOINTS_PER_LIMB]
         self.actor = Actor(recurrent=True, fine_scales=fine_scales, hidden=hidden, oracle=oracle, joints=JOINTS_PER_LIMB,
                            privileged_dim=PRIVILEGED_BLOCKS * JOINTS_PER_LIMB, initial_std=per_limb_std,
-                           extra_inputs=message * (limbs - 1), message=message)
+                           extra_inputs=message * (limbs - 1) + (SENSOR_BLOCKS * JOINTS_PER_LIMB * (limbs - 1) if peek else 0),
+                           message=message)
         self.oracle, self.incremental, self.insight, self.hidden = self.actor.oracle, self.actor.incremental, None, hidden
 
     @property
@@ -70,6 +75,10 @@ class LimbPolicy(nn.Module):
         steps, worlds = observations.shape[:2]
         blocks = PRIVILEGED_BLOCKS if observations.shape[-1] == int(self.privileged_dim) else OBSERVATION_BLOCKS
         per_limb = [limb_slices(observations, blocks, self.count, limb) for limb in range(self.count)]
+        if self.peeking:
+            sensors = [limb_slices(observations, SENSOR_BLOCKS, self.count, limb) for limb in range(self.count)]
+            per_limb = [torch.cat((per_limb[limb], *(sensors[o] for o in range(self.count) if o != limb)), dim=-1)
+                        for limb in range(self.count)]
         states, messages = self._split(feeling)
         if self.msg == 0:
             # No coupling: every limb is an independent sequence, so run them all through the GRU at once.

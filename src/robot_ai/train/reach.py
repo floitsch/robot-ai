@@ -189,7 +189,8 @@ def load_actor(run: Path, device: torch.device) -> Actor:
 
         policy = LimbPolicy(limbs=int(state["limbs"]), message=int(state["message_dim"]),
                             hidden=state["actor.head.weight"].shape[1], fine_scales=state["actor.fine_scales"].tolist(),
-                            oracle=int(state["actor.oracle"])).to(device)
+                            oracle=int(state["actor.oracle"]), peek=bool(state.get("peek", False))).to(device)
+        state.setdefault("peek", torch.tensor(False))
         policy.load_state_dict(state)
         return policy.eval()  # type: ignore[return-value]
     state.setdefault("incremental", torch.tensor(False))
@@ -292,7 +293,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
           friction_probability: float = 0.7, oracle: int = 0, insight_weight: float = 0.0, mixed: bool = False,
           reward_tolerance: float = 0.03, pushes: bool = False, limbs: int = 0, roughness_weight: float | None = None,
           per_limb: bool = False, message: int = 0, severity: float = 1.0, initial: Path | None = None,
-          severity_ramp: int = 0,
+          severity_ramp: int = 0, peek: bool = False,
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
@@ -323,7 +324,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         if not limbs:
             raise ValueError("--per-limb needs --limbs")
         actor = LimbPolicy(limbs=limbs, message=message, hidden=hidden, fine_scales=fine_scales, oracle=oracle,
-                           initial_std=getattr(env, "initial_std", None)).to(dev)  # type: ignore[assignment]
+                           initial_std=getattr(env, "initial_std", None), peek=peek).to(dev)  # type: ignore[assignment]
     else:
         actor = Actor(recurrent=recurrent, incremental=incremental, fine_scales=fine_scales, hidden=hidden, oracle=oracle,
                       insight=insight_weight > 0, joints=getattr(env, "n", 2), privileged_dim=env_privileged_dim(env),
@@ -421,7 +422,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
             initial: Path | None = None, fine_scales: Sequence[float] = FINE_ERROR_SCALES, hidden: int = 64,
             insight_weight: float = 1.0, noise: float = 0.05, mixed: bool = False, pushes: bool = False, history: int = 0,
             limbs: int = 0, per_limb: bool = False, message: int = 0, severity: float = 1.0, teacher_drive: float = 0.0,
-            teacher_omega: float = 15.0, teacher_memoryless: bool = False, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
+            teacher_omega: float = 15.0, teacher_memoryless: bool = False, peek: bool = False, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
             learning_rate: float = 1e-3, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     """Teach a deployable recurrent actor to act like an oracle, using only what a real robot can sense.
 
@@ -451,7 +452,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
     elif per_limb:
         from .limbs import LimbPolicy
 
-        student = LimbPolicy(limbs=limbs, message=message, hidden=hidden, fine_scales=fine_scales).to(dev)  # type: ignore[assignment]
+        student = LimbPolicy(limbs=limbs, message=message, hidden=hidden, fine_scales=fine_scales, peek=peek).to(dev)  # type: ignore[assignment]
     else:
         student = Actor(recurrent=True, fine_scales=fine_scales, hidden=hidden, insight=insight_weight > 0, history=history,
                         joints=oracle.n, privileged_dim=int(oracle.privileged_dim)).to(dev)
@@ -590,6 +591,7 @@ def main() -> None:
         sub.add_argument("--minibatch", type=int, default=512, help="world-chunks per gradient step; halve it if the GPU runs out of memory")
         sub.add_argument("--per-limb", action="store_true", help="one shared two-joint policy per limb instead of one over all joints")
         sub.add_argument("--message", type=int, default=0, help="size of the message limbs exchange each tick (per-limb only)")
+        sub.add_argument("--peek", action="store_true", help="each limb also sees the other limbs' raw sensors (per-limb only)")
 
     for sub in (fit, teach):
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")
@@ -608,6 +610,7 @@ def main() -> None:
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
               severity=args.severity, initial=args.initial, minibatch=args.minibatch, severity_ramp=args.severity_ramp,
+              peek=args.peek,
               output=args.output, device=args.device, worlds=args.worlds,
               iterations=args.iterations, seed=args.seed)
     elif args.command == "distill":
@@ -615,7 +618,7 @@ def main() -> None:
                 iterations=args.iterations, hidden=args.hidden, seed=args.seed, mixed=args.mixed, pushes=args.pushes,
                 history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message, severity=args.severity,
                 minibatch=args.minibatch, teacher_drive=args.teacher_drive, teacher_omega=args.teacher_omega,
-                teacher_memoryless=args.teacher_memoryless)
+                teacher_memoryless=args.teacher_memoryless, peek=args.peek)
     else:
         actors = {name: Path(path) for name, path in (item.split("=", 1) for item in args.actor)}
         print(json.dumps(report(actors, device=args.device, worlds=args.worlds, output=args.output), indent=2))
