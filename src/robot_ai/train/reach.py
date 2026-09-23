@@ -207,6 +207,25 @@ def load_actor(run: Path, device: torch.device) -> Actor:
     return actor.eval()
 
 
+def widen_to_oracle(student: Actor, privileged_dim: int, initial_std: Sequence[float] | None) -> Actor:
+    """An oracle with the student's weights: the encoder gains zero-initialised columns for the privileged inputs."""
+
+    oracle = Actor(recurrent=student.recurrent, incremental=bool(student.incremental), fine_scales=student.fine_scales.tolist(),
+                   hidden=student.hidden, oracle=ORACLE_FULL, insight=student.insight is not None, history=int(student.history),
+                   joints=student.n, privileged_dim=privileged_dim, initial_std=initial_std).to(student.head.weight.device)
+    state = {k: v for k, v in student.state_dict().items()
+             if not k.startswith("encoder.0.weight") and k not in ("oracle", "privileged_dim")}
+    oracle.load_state_dict(state, strict=False)
+    old, new = student.encoder[0].weight, oracle.encoder[0].weight
+    assert isinstance(old, Tensor) and isinstance(new, Tensor)
+    obs = student.observation_dim
+    with torch.no_grad():
+        new.zero_()
+        new[:, :obs] = old[:, :obs]  # the observation block leads both layouts
+        new[:, privileged_dim:privileged_dim + old.shape[1] - obs] = old[:, obs:]  # fine-error (and history) inputs follow
+    return oracle
+
+
 def env_privileged_dim(env: object) -> int:
     return int(getattr(env, "privileged_dim", PRIVILEGED_DIM))
 
@@ -288,6 +307,8 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         actor = load_actor(initial, dev).train()
         if actor.n != getattr(env, "n", 2):
             raise ValueError("the initial policy was trained for a different joint count")
+        if oracle and not int(actor.oracle):
+            actor = widen_to_oracle(actor, env_privileged_dim(env), getattr(env, "initial_std", None)).train()
         # A distilled policy never trained its exploration; start fine-tuning gently, scaled per joint by rated torque.
         stds = getattr(env, "initial_std", None) or [0.5] * actor.n
         inner = getattr(actor, "actor", actor)
