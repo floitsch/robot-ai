@@ -39,6 +39,7 @@ from .joint_model import (
     drive_joint,
     encoder_reading,
     friction_bound,
+    servo_reading,
 )
 
 MAX_JOINTS = 8
@@ -91,7 +92,7 @@ def _delayed_command(ring: wp.array3d(dtype=wp.float32), w: int, j: int, tick: i
                      delay_steps: int) -> float:
     step = tick * substeps + substep - delay_steps
     if step < 0:
-        return 0.0
+        return ring[w, j, RING_DEPTH - 1]  # what reset left there, not yet overwritten: nothing / hold the start
     return ring[w, j, (step // substeps) % RING_DEPTH]
 
 
@@ -138,7 +139,10 @@ def _step_tick(
     changed = tick >= change_tick[w]
     g = gravity[w]
     for j in range(n):
-        command_ring[w, j, tick % RING_DEPTH] = wp.clamp(commands[w, j], -1.0, 1.0)
+        if params[w, j].servo_gain > 0.0:
+            command_ring[w, j, tick % RING_DEPTH] = commands[w, j]  # a target angle
+        else:
+            command_ring[w, j, tick % RING_DEPTH] = wp.clamp(commands[w, j], -1.0, 1.0)
         metrics[w, 2 + j] = 0.0
         metrics[w, 2 + n + j] = 0.0
         scratch[w, 7, j] = 0.0  # mean motor torque accumulator for the current sensor
@@ -403,8 +407,12 @@ def _reset(
         s.qm = s.q
         reading = encoder_reading(p, s.q, wp.randn(state))
         s.enc_prev = reading
+        hold = float(0.0)
+        if p.servo_gain > 0.0:
+            hold = servo_reading(p, s.q)  # a servo holds where it is until the first target arrives
+            s.servo_prev = hold
         for k in range(RING_DEPTH):
-            command_ring[w, j, k] = 0.0
+            command_ring[w, j, k] = hold
             encoder_ring[w, j, k] = reading
         states[w, j] = s
         observation[w, j] = reading

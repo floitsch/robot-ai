@@ -14,6 +14,8 @@ import warp as wp
 STRIBECK_VELOCITY = 0.05
 # Depth of the command and encoder delay rings, in control ticks.
 RING_DEPTH = 4
+# A position servo's velocity estimate: first-order filter on its own encoder's differences, per physics step.
+SERVO_VELOCITY_FILTER = 0.05
 
 
 @wp.struct
@@ -52,6 +54,14 @@ class JointParams:
     cur_gain: float
     cur_bias: float
     cur_noise: float
+    # Position servo (hobby servo, Feetech STS, Dynamixel, closed-loop stepper). With servo_gain > 0 the command is a
+    # target angle in encoder units, tracked every physics step by the servo's own loop: PWM duty =
+    # gain * (error - damping * velocity), limited to +-1, on its own undelayed encoder; the motor then delivers
+    # stall torque * (duty - speed / no-load speed). 0 selects torque commands.
+    servo_gain: float  # duty per rad of error
+    servo_damping: float  # s: velocity weight relative to error
+    servo_quantum: float  # rad per count of the servo's encoder; 0 = continuous
+    servo_deadband: float  # rad: errors this small are ignored
 
 
 @wp.struct
@@ -64,6 +74,8 @@ class JointState:
     tau_out: float  # torque the transmission put on the output this physics step
     enc_prev: float  # previously delivered encoder value
     vel_est: float  # causal velocity estimate derived from delivered encoder values
+    servo_prev: float  # position servo: its previous encoder reading
+    servo_vel: float  # position servo: its filtered velocity
 
 
 @wp.func
@@ -78,12 +90,41 @@ def friction_bound(p: JointParams, q: float, dq: float) -> float:
 
 
 @wp.func
-def drive_joint(p: JointParams, s: JointState, command: float, dt: float) -> JointState:
-    """Advance motor and rotor by one physics step and set `tau_out`."""
+def servo_reading(p: JointParams, q: float) -> float:
+    """What a position servo's own encoder says: the output angle with the joint's zero error, in its counts."""
 
-    target = wp.clamp(command, -1.0, 1.0) * p.torque_scale
-    s.motor_torque = s.motor_torque + p.motor_alpha * (target - s.motor_torque)
+    value = q + p.enc_bias
+    if p.servo_quantum > 0.0:
+        value = wp.round(value / p.servo_quantum) * p.servo_quantum
+    return value
+
+
+@wp.func
+def _drive_servo(p: JointParams, s: JointState, target: float, dt: float) -> JointState:
+    reading = servo_reading(p, s.q)
+    s.servo_vel = s.servo_vel + SERVO_VELOCITY_FILTER * ((reading - s.servo_prev) / dt - s.servo_vel)
+    s.servo_prev = reading
+    error = target - reading
+    if wp.abs(error) <= p.servo_deadband:
+        error = 0.0
+    duty = wp.clamp(p.servo_gain * (error - p.servo_damping * s.servo_vel), -1.0, 1.0)
+    speed = s.dq
+    if p.half_gap > 0.0:
+        speed = s.dqm
+    # Voltage drive: back-EMF takes torque away as the motor speeds up, and brakes it when the duty drops.
+    torque = duty * p.torque_scale
     if p.no_load_speed > 0.0:
+        torque = torque - p.torque_scale * speed / p.no_load_speed
+    torque = wp.clamp(torque, -p.torque_scale, p.torque_scale)  # current limit
+    s.motor_torque = s.motor_torque + p.motor_alpha * (torque - s.motor_torque)
+    return _transmit(p, s, dt)
+
+
+@wp.func
+def _transmit(p: JointParams, s: JointState, dt: float) -> JointState:
+    """Torque-speed envelope (torque drives), then the transmission to the output, rigid or with backlash."""
+
+    if p.no_load_speed > 0.0 and p.servo_gain <= 0.0:
         # Torque-speed curve: the faster the motor turns, the less torque it can add in that direction; braking is
         # always available.
         speed = s.dq
@@ -110,6 +151,17 @@ def drive_joint(p: JointParams, s: JointState, command: float, dt: float) -> Joi
     s.qm = s.qm + dt * s.dqm
     s.tau_out = coupling
     return s
+
+
+@wp.func
+def drive_joint(p: JointParams, s: JointState, command: float, dt: float) -> JointState:
+    """Advance motor and rotor by one physics step and set `tau_out`."""
+
+    if p.servo_gain > 0.0:
+        return _drive_servo(p, s, command, dt)
+    target = wp.clamp(command, -1.0, 1.0) * p.torque_scale
+    s.motor_torque = s.motor_torque + p.motor_alpha * (target - s.motor_torque)
+    return _transmit(p, s, dt)
 
 
 @wp.func

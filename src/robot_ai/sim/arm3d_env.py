@@ -40,6 +40,8 @@ NOMINAL_TORQUES = np.array([3.0, 8.0, 5.0, 1.5, 0.8])
 LIMITS = np.array([[-2.6, 2.6], [-1.7, 1.7], [-2.4, 2.4], [-2.0, 2.0], [-2.9, 2.9]])
 GOAL_SPAN = np.array([1.6, 1.0, 1.4, 1.4, 2.0])
 TASK_CODE = 3
+# Position servos: the policy moves each target by up to this much from the inverse-kinematics solution, rad.
+SERVO_REACH = 0.3
 # The shared defect model's friction is sized for the planar arm's 3 N m elbow; gears and bearings scale with the joint.
 FRICTION_SCALE = NOMINAL_TORQUES / 3.0
 POSITION_UNIT = 0.005 / TOLERANCE  # m of tool position error that count like 1 rad of joint error: 5 mm ~ 30 mrad
@@ -87,6 +89,21 @@ def add_tool_mass(links: np.ndarray, tip: np.ndarray, added: np.ndarray) -> None
 
     last["inertia"] = inertia + shift(mass, com - new_com) + shift(added, tip - new_com)
     last["mass"], last["com"] = total, new_com
+
+
+def sample_servos(rng: np.random.Generator, joints: np.ndarray) -> None:
+    """Make every joint a position servo with its own tuning, in place: a property of the servo, not a defect.
+
+    Full duty at 0.04-0.16 rad of error (a 4x spread of stiffness, as between LeRobot's and Feetech's default gains),
+    a 12-bit magnetic encoder, and a deadband of up to two counts.
+    """
+
+    shape = joints.shape
+    count = 2.0 * np.pi / 4096
+    joints["servo_gain"] = 1.0 / rng.uniform(0.04, 0.16, shape)
+    joints["servo_damping"] = rng.uniform(0.005, 0.03, shape)
+    joints["servo_quantum"] = count
+    joints["servo_deadband"] = rng.integers(0, 3, shape) * count
 
 
 def sample_arm3d_population(rng: np.random.Generator, worlds: int, *, severity: float | np.ndarray = 1.0,
@@ -243,7 +260,7 @@ class Arm3DEnv(ChainEnv):
     inverse-kinematics solution (n); the goal: tool point/0.5 m (3), direction (3), roll/pi (1), and that
     solution/pi (n); where the encoders say the tool is: point/0.5 m (3), direction (3); the arm's link
     lengths/0.25 m (n). Privileged: observation, true q/pi, dq/5 (n each), true pose error (7), hidden
-    condition (10n). Errors are in joint-like units, so the usual 0.03 tolerance means 5 mm and 30 mrad.
+    condition (12n). Errors are in joint-like units, so the usual 0.03 tolerance means 5 mm and 30 mrad.
     """
 
     task_code = TASK_CODE
@@ -251,11 +268,15 @@ class Arm3DEnv(ChainEnv):
 
     def __init__(self, worlds: int, *, device: str = "cuda:0", seed: int = 0, severity: float = 1.0,
                  episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
-                 still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False) -> None:
+                 still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False, servo: bool = False) -> None:
         self.worlds, self.limbs, self.n, self.limb_joints = worlds, 1, JOINTS, JOINTS
         # Mixed: every robot gets its own severity, from flawless to `severity`, so training on worn arms does not
         # cost precision on good ones.
         self.mixed = mixed
+        # Servo: the joints are position servos, as on nearly every cheap arm, and the policy's action moves their
+        # targets around the inverse-kinematics solution; otherwise it commands torque directly.
+        self.servo = servo
+        self.task_code = TASK_CODE + 1 if servo else TASK_CODE
         self.device, self.severity, self.episode_ticks, self.changes = device, severity, episode_ticks, changes
         self.reward_tolerance, self.still_weight, self.roughness_weight = reward_tolerance, still_weight, roughness_weight
         self.rng = np.random.default_rng([seed, 3000 + JOINTS])
@@ -265,17 +286,18 @@ class Arm3DEnv(ChainEnv):
             wp.set_stream(wp.stream_from_torch(torch.cuda.current_stream(self.torch_device)), device)
         self.nominal_torques = NOMINAL_TORQUES
         self._torque = torch.as_tensor(NOMINAL_TORQUES, dtype=torch.float32, device=self.torch_device)
-        self.initial_std = [0.5] * JOINTS
+        self.initial_std = [0.3 if servo else 0.5] * JOINTS
         self.observation_dim = 4 * self.n + 7 + self.n + 7 + self.n + 6 + self.n
         self.error_slice = (4 * self.n, 7 + self.n)
-        self.privileged_dim = self.observation_dim + 2 * self.n + 7 + 10 * self.n
+        self.privileged_dim = self.observation_dim + 2 * self.n + 7 + 12 * self.n
 
     def _hidden(self, links: np.ndarray, joints: np.ndarray) -> Tensor:
         return self._tensor(np.concatenate((joints["torque_scale"] / NOMINAL_TORQUES, joints["coulomb"] * 4.0,
                                             joints["half_gap"] * 50.0, joints["damping"] * 10.0, joints["delay_steps"] / 30.0,
                                             links["mass"], links["gear_loss"] * 4.0, links["bearing_loss"] * 7.0,
                                             links["compliance"] * NOMINAL_TORQUES / BEND_AT_RATED,
-                                            joints["no_load_speed"] / 10.0), axis=1))
+                                            joints["no_load_speed"] / 10.0, joints["servo_gain"] / 25.0,
+                                            joints["servo_damping"] * 50.0), axis=1))
 
     def _poses(self, links: np.ndarray, tip: np.ndarray) -> np.ndarray:
         """Joint configurations [worlds, n] in the goal span whose tool point clears the table."""
@@ -293,6 +315,8 @@ class Arm3DEnv(ChainEnv):
     def reset(self) -> Tensor:
         severity = self.rng.uniform(0.0, self.severity, self.worlds) if self.mixed else self.severity
         links, joints, tip = sample_arm3d_population(self.rng, self.worlds, severity=severity)
+        if self.servo:
+            sample_servos(self.rng, joints)
         changed = sample_arm3d_change(self.rng, links, joints, tip, severity=severity)
         ticks = self.episode_ticks
         change_tick = np.where(self.rng.random(self.worlds) < (0.5 if self.changes else 0.0),
@@ -389,7 +413,11 @@ class Arm3DEnv(ChainEnv):
         n = self.n
         action = action.clamp(-1.0, 1.0)
         smooth = action if reference is None else reference.clamp(-1.0, 1.0)
-        self.batch.step(action)
+        if self.servo:
+            limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device)
+            self.batch.step(torch.maximum(torch.minimum(self.joint_goal() + SERVO_REACH * action, limits[:, 1]), limits[:, 0]))
+        else:
+            self.batch.step(action)
         self.tick += 1
         pose_error = self._true_error()
         error = torch.stack((pose_error[:, :3].norm(dim=1), pose_error[:, 3:6].norm(dim=1), pose_error[:, 6].abs()), dim=1)

@@ -253,3 +253,65 @@ def test_inverse_kinematics_finds_the_sampled_pose_and_its_alternatives() -> Non
     wrapped = torch.remainder(goals + torch.pi, 2.0 * torch.pi) - torch.pi
     assert ((solutions - wrapped[:, None]).abs().amax(dim=2).amin(dim=1) < 1e-4).all()  # the sampled one is among them (float32 goals)
     assert ((solutions.float() - env.joint_goal()[:, None]).abs().amax(dim=2).amin(dim=1) < 1e-4).all()  # the teacher picks one
+
+
+def _servo_joints(worlds: int) -> np.ndarray:
+    joints = _healthy_joints(worlds, limit=10.0)
+    joints["servo_gain"], joints["servo_damping"] = 10.0, 0.02
+    joints["servo_quantum"] = 2.0 * np.pi / 4096
+    joints["no_load_speed"] = 6.0
+    return joints
+
+
+def test_position_servos_hold_an_arm_against_gravity() -> None:
+    links, tip = _arm(1)
+    joints = _servo_joints(1)
+    pose = np.array([0.3, 1.0, 0.6, -0.4, 0.2], dtype=np.float32)
+    batch = Arm3DBatch(links, joints, tip, device="cpu")
+    batch.reset(pose)
+    for _ in range(150):
+        batch.step(pose[None])  # target: stay where you are
+    q, dq = batch.truth.numpy()[0, :JOINTS], batch.truth.numpy()[0, JOINTS:]
+    # A proportional servo sags until its error pays for the load: gravity torque / (stall torque * gain).
+    assert np.abs(q - pose).max() < 0.05 and np.abs(dq).max() < 0.05
+
+
+def test_a_position_servo_reaches_a_new_target_despite_host_latency() -> None:
+    links, tip = _arm(1)
+    joints = _servo_joints(1)
+    joints["delay_steps"] = 30  # the host's command arrives 30 ms late; the servo's own loop is not delayed
+    joints["q_min"][:, 1:] = joints["q_max"][:, 1:] = 0.0  # the rest held upright: a clean single-joint step
+    batch = Arm3DBatch(links, joints, tip, device="cpu")
+    batch.reset(np.zeros(JOINTS))
+    target = np.zeros((1, JOINTS), dtype=np.float32)
+    target[0, 0] = 0.5
+    path = []
+    for _ in range(100):
+        batch.step(target)
+        path.append(float(batch.truth.numpy()[0, 0]))
+    assert abs(path[1]) < 1e-3  # nothing happens before the command arrives
+    assert abs(path[-1] - 0.5) < 0.005 and max(path) < 0.55  # settles on target without much overshoot
+
+
+def test_position_servos_with_backlash_on_a_light_wrist_stay_stable() -> None:
+    links, tip = _arm(4)
+    joints = _servo_joints(4)
+    joints["half_gap"][:, 4], joints["mesh_stiffness"][:, 4], joints["mesh_damping"][:, 4] = 0.01, 400.0, 0.05
+    pose = np.array([0.0, 0.8, 0.5, -0.3, 0.0], dtype=np.float32)
+    batch = Arm3DBatch(links, joints, tip, device="cpu")
+    batch.reset(pose)
+    rng = np.random.default_rng(2)
+    for _ in range(200):
+        batch.step((pose + rng.uniform(-0.2, 0.2, (4, JOINTS))).astype(np.float32))
+    assert np.isfinite(batch.truth.numpy()).all() and np.abs(batch.truth.numpy()[:, JOINTS:]).max() < 20.0
+
+
+def test_servo_arms_reach_healthy_goals_with_the_inverse_kinematics_targets_alone() -> None:
+    env = Arm3DEnv(64, device="cpu", seed=9, severity=0.0, changes=False, servo=True)
+    env.reset()
+    with torch.no_grad():
+        for _ in range(env.episode_ticks):
+            env.step(torch.zeros(64, JOINTS))  # the policy's "do nothing": targets at the IK solution
+    summary = env.summary()
+    # Proportional servos sag under load, so this is a baseline, not a solution: most arms end near the goal.
+    assert summary.position_error.median() < 0.02

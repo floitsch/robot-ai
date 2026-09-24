@@ -32,7 +32,8 @@ EVAL_SEED = 987_654_321
 # actors also see it magnified and saturated at these scales, rad.
 FINE_ERROR_SCALES = (0.05, 0.5)
 ORACLE_FULL, ORACLE_CONDITION = 1, 2
-ARM3D_TASK = 3  # the 3D arm's task code (`arm3d_env.TASK_CODE`), saved in an Actor's layout
+# The 3D arm's task codes (`arm3d_env.TASK_CODE`, + 1 with position servos), saved in an Actor's layout.
+ROBOT_BY_TASK = {3: "arm3d", 4: "arm3d-servo"}
 # Per joint: the observation holds 6 blocks (q, dq, current, goal, error, previous command); the privileged
 # part starts with true q and dq. The single arm has 2 joints; chains have more.
 OBSERVATION_BLOCKS = 6
@@ -272,8 +273,8 @@ def _metrics(summary: EpisodeSummary | ChainSummary | Arm3DSummary) -> dict[str,
 @torch.no_grad()
 def evaluate(controller: PidController | Actor, *, worlds: int, device: str, severity: float = 1.0,
              changes: bool = True, pushes: bool = False, seed: int = EVAL_SEED, limbs: int = 0, robot: str = "") -> dict[str, float]:
-    if not robot and isinstance(controller, nn.Module) and getattr(controller, "task", 0) == ARM3D_TASK:
-        robot = "arm3d"
+    if not robot and isinstance(controller, nn.Module):
+        robot = ROBOT_BY_TASK.get(getattr(controller, "task", 0), "")
     if limbs == 0 and not robot and isinstance(controller, nn.Module) and controller.n != 2:
         limbs = controller.n // 2
     env = make_env(worlds, device=device, seed=seed, limbs=limbs, robot=robot, severity=severity, changes=changes,
@@ -308,10 +309,11 @@ def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, robot: str 
     """The planar arm, a stacked chain of `limbs` two-joint limbs when `limbs` is given, or the 3D arm."""
 
     allowed = {"severity", "changes", "reward_tolerance", "still_weight", "roughness_weight"}
-    if robot == "arm3d":
+    if robot.startswith("arm3d"):
         from ..sim.arm3d_env import Arm3DEnv
 
-        return Arm3DEnv(worlds, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed | {"mixed"}})  # type: ignore[arg-type,return-value]
+        return Arm3DEnv(worlds, device=device, seed=seed, servo=robot == "arm3d-servo",
+                        **{k: v for k, v in settings.items() if k in allowed | {"mixed"}})  # type: ignore[arg-type,return-value]
     if limbs:
         return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
     return ReachEnv(worlds, device=device, seed=seed, **settings)  # type: ignore[arg-type]
@@ -661,8 +663,8 @@ def main() -> None:
         sub.add_argument("--identity", action="store_true", help="each limb is told its slot in the chain (per-limb only)")
 
     for sub in (fit, teach):
-        sub.add_argument("--robot", choices=("planar", "arm3d"), default="planar",
-                         help="arm3d: five-joint 3D arms with tool-pose goals")
+        sub.add_argument("--robot", choices=("planar", "arm3d", "arm3d-servo"), default="planar",
+                         help="arm3d: five-joint 3D arms with tool-pose goals, driven by torque or by position servos")
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")
         sub.add_argument("--pushes", action="store_true", help="train with neighbour pushes at full severity")
     compare = commands.add_parser("report")
