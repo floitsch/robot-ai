@@ -31,7 +31,8 @@ tick as ten 1 ms physics steps. Each physics step:
 **Checked against MuJoCo** (`tests/test_arm3d.py`): the joint angles and the tool point agree to 2 mrad
 and 2 mm, both for a 1.7 s swing and for a violent fall from upright with all five joints coupled.
 
-Every joint keeps the planar arms' defect model:
+Every joint keeps the planar arms' defect model, with friction and drag scaled to the joint's motor (a
+0.8 N m wrist servo has smaller gears and bearings than an 8 N m shoulder):
 - weak or lagging motors, command latency;
 - backlash;
 - viscous, dry and sticky friction, including rough spots at particular angles;
@@ -79,11 +80,11 @@ robot (knowledge no real controller has), measured on 4,096 robots:
 | Robots | Success | Median tool error |
 | --- | --- | --- |
 | Healthy | 99.4% | 0.0 mm |
-| Defective | 1.5% | 16.2 mm, 88 mrad |
-| Defective, changing mid-move | 1.3% | 15.9 mm, 92 mrad |
+| Defective | 1.9% | 14.6 mm, 66 mrad |
+| Defective, changing mid-move | 1.9% | 14.5 mm, 68 mrad |
 
-Perfect knowledge of the rigid-body dynamics does not help against friction on the light wrist
-joints, load drag and sag. The network has to close that gap.
+Perfect knowledge of the rigid-body dynamics does not help against dry friction without integral action,
+gear slack, latency, load drag and sag. The network has to close that gap.
 
 ### Inverse kinematics: computed, not learned
 
