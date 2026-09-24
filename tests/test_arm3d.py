@@ -16,6 +16,7 @@ from robot_ai.sim.arm3d_env import (
     _links,
     add_tool_mass,
     arm3d_dynamics,
+    arm3d_tool,
 )
 from robot_ai.sim.joint_model import JointParams
 
@@ -237,3 +238,19 @@ def test_a_motor_cannot_drive_past_its_no_load_speed() -> None:
         batch.step(command)
     speed = float(batch.truth.numpy()[0, JOINTS])
     assert 5.0 < speed < 6.0
+
+
+def test_every_alternative_joint_solution_reaches_the_same_tool_pose() -> None:
+    env = Arm3DEnv(64, device="cpu", seed=4, severity=1.0, changes=False)
+    env.reset()
+    goals = env._goals[0]
+    alternatives = env.alternatives(goals)
+    point, direction = arm3d_tool(goals, env._joint_pos, env._axis, env._tip_offset)
+    for k in range(4):
+        other = alternatives[:, k]
+        other_point, other_direction = arm3d_tool(other, env._joint_pos, env._axis, env._tip_offset)
+        assert (other_point - point).abs().max() < 1e-4 and (other_direction - direction).abs().max() < 1e-4
+        assert torch.allclose(other[:, 4], goals[:, 4])
+    assert (alternatives[:, 1] - goals).abs().amax(dim=1).median() > 0.1  # the elbow flip is a genuinely different pose
+    chosen = env.joint_goal()
+    assert torch.isin(chosen, alternatives).all()

@@ -270,6 +270,7 @@ class Arm3DEnv(ChainEnv):
         joint_goals = np.stack((self._poses(links, tip), self._poses(links, tip)))
         regoal = np.where(self.rng.random(self.worlds) < 0.7, self.rng.integers(80, ticks - 120, self.worlds), ticks + 1)
         self.links, self.joints, self.changed, self.change_tick, self.regoal_tick = links, joints, changed, change_tick, regoal
+        self._tensors: dict[int, tuple[np.ndarray, np.ndarray, dict[str, tuple[Tensor, Tensor]]]] = {}
         self.tip_offset = tip
         # The arm as its maker describes it: kinematics for the controller's own reckoning, and lengths as inputs.
         self._joint_pos, self._axis = self._tensor(links["joint_pos"]), self._tensor(links["axis"])
@@ -280,6 +281,8 @@ class Arm3DEnv(ChainEnv):
         self._pose_goals = torch.stack([torch.cat((*arm3d_tool(g, self._joint_pos, self._axis, self._tip_offset),
                                                    g[:, -1:]), dim=1) for g in self._goals])
         self._regoal = self._tensor(regoal)
+        self._solution = self._goals[0].clone()
+        self._solution_phase = torch.ones(self.worlds, dtype=torch.bool, device=self.torch_device)  # none chosen yet
         self._change_tick = self._tensor(np.minimum(change_tick, ticks + 1))
         self._bias = self._tensor(joints["enc_bias"])
         self._hidden_before, self._hidden_after = self._hidden(links, joints), self._hidden(*changed)
@@ -305,10 +308,44 @@ class Arm3DEnv(ChainEnv):
 
         return torch.where(self._later(), self._pose_goals[1], self._pose_goals[0])
 
-    def joint_goal(self) -> Tensor:
-        """Joint angles at which the rigid arm reaches the goal pose; for classical teachers, never for policies."""
+    def alternatives(self, q: Tensor) -> Tensor:
+        """[W, 4, n]: every joint solution that puts the rigid arm's tool in the same pose (and roll) as `q`.
 
-        return torch.where(self._later(), self._goals[1], self._goals[0])
+        Elbow flipped across the line from shoulder to wrist, and the base turned half round with every pitch
+        negated, in all combinations. Some may lie outside the joint limits.
+        """
+
+        upper, lower = self._joint_pos[:, 2, 2], self._joint_pos[:, 3, 2]
+        shoulder, elbow = q[:, 1], q[:, 1] + q[:, 2]
+        line = torch.atan2(upper * torch.sin(shoulder) + lower * torch.sin(elbow), upper * torch.cos(shoulder) + lower * torch.cos(elbow))
+        flipped_shoulder = 2.0 * line - q[:, 1]
+        flipped = torch.stack((q[:, 0], flipped_shoulder, -q[:, 2], q[:, 1] + 2.0 * q[:, 2] + q[:, 3] - flipped_shoulder, q[:, 4]), 1)
+
+        def turned(x: Tensor) -> Tensor:
+            return torch.stack((x[:, 0] + torch.pi, -x[:, 1], -x[:, 2], -x[:, 3], x[:, 4]), 1)
+
+        solutions = torch.stack((q, flipped, turned(q), turned(flipped)), 1)
+        return torch.remainder(solutions + torch.pi, 2.0 * torch.pi) - torch.pi
+
+    def joint_goal(self) -> Tensor:
+        """Joint angles at which the rigid arm reaches the goal pose; for classical teachers, never for policies.
+
+        Of the solutions within the joint limits, the one nearest the arm's pose when the goal appeared, so a
+        student imitating the teacher can tell from what it senses which one the teacher is heading for.
+        """
+
+        later = self._later()[:, 0]
+        stale = self._solution_phase != later
+        if stale.any():
+            candidates = self.alternatives(torch.where(later[:, None], self._goals[1], self._goals[0]))
+            limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device) * 0.97
+            valid = ((candidates >= limits[:, 0]) & (candidates <= limits[:, 1])).all(dim=2)
+            here = self._truth[:, :self.n] + self._bias
+            distance = torch.where(valid, (candidates - here[:, None]).abs().sum(dim=2), torch.inf)
+            nearest = candidates[torch.arange(self.worlds, device=self.torch_device), distance.argmin(dim=1)]
+            self._solution = torch.where(stale[:, None], nearest, self._solution)
+            self._solution_phase = later.clone()
+        return self._solution
 
     def _pose_error(self, point: Tensor, direction: Tensor, roll: Tensor) -> Tensor:
         goal = self.goal()

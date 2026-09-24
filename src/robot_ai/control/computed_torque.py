@@ -96,10 +96,8 @@ class ComputedTorqueTeacher(nn.Module):
 
     def _friction_bound(self, q: Tensor, dq: Tensor, device: torch.device) -> Tensor:
         env = self.env
-        changed = torch.as_tensor(env.tick >= env.change_tick, device=device)[:, None]
-        j, cj = env.joints, env.changed[1]
-        field = lambda name: torch.where(changed, torch.as_tensor(cj[name], dtype=torch.float32, device=device),
-                                         torch.as_tensor(j[name], dtype=torch.float32, device=device))
+        joints = env._current(env.joints, env.changed[1], device)
+        field = joints.__getitem__
         rub = field("bump0_mag") * torch.exp(-0.5 * ((q - field("bump0_center")) / field("bump0_width")) ** 2)
         rub = rub + field("bump1_mag") * torch.exp(-0.5 * ((q - field("bump1_center")) / field("bump1_width")) ** 2)
         return field("coulomb") * (1.0 + field("stribeck") * torch.exp(-(dq / 0.05) ** 2)) + rub

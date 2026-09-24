@@ -137,6 +137,7 @@ class ChainEnv:
         goals = self.rng.uniform(-span, span, (2, self.worlds, self.n))
         regoal = np.where(self.rng.random(self.worlds) < 0.7, self.rng.integers(80, ticks - 120, self.worlds), ticks + 1)
         self.links, self.joints, self.changed, self.change_tick, self.regoal_tick = links, joints, changed, change_tick, regoal
+        self._tensors: dict[int, tuple[np.ndarray, np.ndarray, dict[str, tuple[Tensor, Tensor]]]] = {}
         self._goals, self._regoal = self._tensor(goals), self._tensor(regoal)
         self._change_tick = self._tensor(np.minimum(change_tick, ticks + 1))
         self._bias = self._tensor(joints["enc_bias"])
@@ -213,13 +214,15 @@ class ChainEnv:
     def _current(self, before: np.ndarray, after: np.ndarray, device: torch.device) -> dict[str, Tensor]:
         """Every field of a structured parameter array as a tensor, after the mid-episode change where it happened."""
 
+        # Teachers ask every tick: convert each population once, not once per tick.
+        cache: dict[int, tuple[np.ndarray, np.ndarray, dict[str, tuple[Tensor, Tensor]]]] = self.__dict__.setdefault("_tensors", {})
+        key = id(before)
+        if key not in cache or cache[key][0] is not before or cache[key][1] is not after:
+            cache[key] = (before, after, {name: tuple(  # type: ignore[misc]
+                torch.as_tensor(np.ascontiguousarray(values[name]), dtype=torch.float32, device=device) for values in (before, after))
+                for name in before.dtype.names or ()})
         changed = torch.as_tensor(self.tick >= self.change_tick, device=device)
-        result = {}
-        for name in before.dtype.names or ():
-            a = torch.as_tensor(np.ascontiguousarray(before[name]), dtype=torch.float32, device=device)
-            b = torch.as_tensor(np.ascontiguousarray(after[name]), dtype=torch.float32, device=device)
-            result[name] = torch.where(changed.reshape(-1, *([1] * (a.dim() - 1))), b, a)
-        return result
+        return {name: torch.where(changed.reshape(-1, *([1] * (a.dim() - 1))), b, a) for name, (a, b) in cache[key][2].items()}
 
     def true_dynamics(self, q: Tensor, dq: Tensor) -> tuple[Tensor, Tensor]:
         """Mass matrix and bias torques of the robots as they really are now; for teachers, never for policies."""
