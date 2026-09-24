@@ -95,7 +95,7 @@ def sample_servos(rng: np.random.Generator, joints: np.ndarray) -> None:
     """Make every joint a position servo with its own tuning, in place: a property of the servo, not a defect.
 
     Full duty at 0.04-0.16 rad of error (a 4x spread of stiffness, as between LeRobot's and Feetech's default gains),
-    a 12-bit magnetic encoder, and a deadband of up to two counts.
+    a 12-bit magnetic encoder that the host reads too, a deadband of up to two counts, and a 0.5-3 ms motor.
     """
 
     shape = joints.shape
@@ -104,6 +104,13 @@ def sample_servos(rng: np.random.Generator, joints: np.ndarray) -> None:
     joints["servo_damping"] = rng.uniform(0.005, 0.03, shape)
     joints["servo_quantum"] = count
     joints["servo_deadband"] = rng.integers(0, 3, shape) * count
+    # The host reads the servo's own encoder over the bus: the same counts, flickering by about one, late by the
+    # bus delay. A coarser or noisier reading than the servo's own belongs to torque drives with separate encoders.
+    joints["enc_quantum"] = count
+    joints["enc_noise"] = np.minimum(joints["enc_noise"], 0.5 * count)
+    # A voltage-driven motor's current follows within its electrical time constant, and the servo's firmware is tuned
+    # for it; a slow torque response is a torque-drive defect and would make any servo's own loop oscillate.
+    joints["motor_alpha"] = 1.0 - np.exp(-0.001 / rng.uniform(0.0005, 0.003, shape))
 
 
 def sample_arm3d_population(rng: np.random.Generator, worlds: int, *, severity: float | np.ndarray = 1.0,
