@@ -16,6 +16,7 @@ from robot_ai.sim.arm3d_env import (
     _links,
     add_tool_mass,
     arm3d_dynamics,
+    arm3d_inverse,
     arm3d_tool,
 )
 from robot_ai.sim.joint_model import JointParams
@@ -240,17 +241,15 @@ def test_a_motor_cannot_drive_past_its_no_load_speed() -> None:
     assert 5.0 < speed < 6.0
 
 
-def test_every_alternative_joint_solution_reaches_the_same_tool_pose() -> None:
+def test_inverse_kinematics_finds_the_sampled_pose_and_its_alternatives() -> None:
     env = Arm3DEnv(64, device="cpu", seed=4, severity=1.0, changes=False)
     env.reset()
-    goals = env._goals[0]
-    alternatives = env.alternatives(goals)
-    point, direction = arm3d_tool(goals, env._joint_pos, env._axis, env._tip_offset)
+    goals, pose = env._goals[0].double(), env._pose_goals[0].double()
+    joint_pos, tip = env._joint_pos.double(), env._tip_offset.double()
+    solutions = arm3d_inverse(pose, joint_pos, tip)
     for k in range(4):
-        other = alternatives[:, k]
-        other_point, other_direction = arm3d_tool(other, env._joint_pos, env._axis, env._tip_offset)
-        assert (other_point - point).abs().max() < 1e-4 and (other_direction - direction).abs().max() < 1e-4
-        assert torch.allclose(other[:, 4], goals[:, 4])
-    assert (alternatives[:, 1] - goals).abs().amax(dim=1).median() > 0.1  # the elbow flip is a genuinely different pose
-    chosen = env.joint_goal()
-    assert torch.isin(chosen, alternatives).all()
+        point, direction = arm3d_tool(solutions[:, k], joint_pos, env._axis.double(), tip)
+        assert (point - pose[:, :3]).abs().max() < 1e-6 and (direction - pose[:, 3:6]).abs().max() < 1e-6
+    wrapped = torch.remainder(goals + torch.pi, 2.0 * torch.pi) - torch.pi
+    assert ((solutions - wrapped[:, None]).abs().amax(dim=2).amin(dim=1) < 1e-4).all()  # the sampled one is among them (float32 goals)
+    assert ((solutions.float() - env.joint_goal()[:, None]).abs().amax(dim=2).amin(dim=1) < 1e-4).all()  # the teacher picks one

@@ -143,6 +143,32 @@ def arm3d_tool(q: Tensor, joint_pos: Tensor, axis: Tensor, tip: Tensor) -> tuple
     return pos + (rot @ tip[..., None])[..., 0], (rot @ torch.nn.functional.normalize(tip, dim=-1)[..., None])[..., 0]
 
 
+def arm3d_inverse(pose: Tensor, joint_pos: Tensor, tip: Tensor) -> Tensor:
+    """[W, 4, 5]: the joint solutions that put the nominal-layout arm's tool at `pose` [W, 7] (point, direction, roll).
+
+    Base turned towards the tool or half round from it, each with the elbow either way; angles in (-pi, pi], some
+    possibly outside the joint limits. Closed form: the wrist-pitch joint sits behind the tool point along the tool
+    direction, and the shoulder and elbow form a two-link arm in the vertical plane through the base.
+    """
+
+    base, upper, lower = joint_pos[:, 1, 2], joint_pos[:, 2, 2], joint_pos[:, 3, 2]
+    point, direction, roll = pose[:, :3], pose[:, 3:6], pose[:, 6]
+    wrist = point - (joint_pos[:, 4, 2] + tip[:, 2])[:, None] * direction
+    towards = torch.where(direction[:, :2].norm(dim=1) > 1e-3, torch.atan2(direction[:, 1], direction[:, 0]),
+                          torch.atan2(wrist[:, 1], wrist[:, 0]))
+    solutions = []
+    for yaw in (towards, towards + torch.pi):
+        c, s = torch.cos(yaw), torch.sin(yaw)
+        reach, height = wrist[:, 0] * c + wrist[:, 1] * s, wrist[:, 2] - base
+        pitch = torch.atan2(direction[:, 0] * c + direction[:, 1] * s, direction[:, 2])
+        bend = ((reach**2 + height**2 - upper**2 - lower**2) / (2.0 * upper * lower)).clamp(-1.0, 1.0)
+        for sign in (1.0, -1.0):
+            elbow = sign * torch.acos(bend)
+            shoulder = torch.atan2(reach, height) - torch.atan2(lower * torch.sin(elbow), upper + lower * torch.cos(elbow))
+            solutions.append(torch.stack((yaw, shoulder, elbow, pitch - shoulder - elbow, roll), dim=1))
+    return torch.remainder(torch.stack(solutions, dim=1) + torch.pi, 2.0 * torch.pi) - torch.pi
+
+
 def arm3d_dynamics(q: Tensor, dq: Tensor, joint_pos: Tensor, axis: Tensor, com: Tensor, mass: Tensor, inertia: Tensor,
                    gravity: float = 9.81) -> tuple[Tensor, Tensor]:
     """Mass matrix [W, n, n] and bias torques [W, n] of 3D serial arms, the kernel's formulation in Torch.
@@ -210,10 +236,11 @@ class Arm3DSummary(ChainSummary):
 class Arm3DEnv(ChainEnv):
     """Tool-pose goals on a population of five-joint 3D arms, with `ChainEnv`'s reward shape and success rule.
 
-    Observation (45): q/pi, dq/5, current/rated, previous command (n each); the pose error the encoders see:
-    tool position (3, in POSITION_UNIT), tool direction (3), wrist roll (1); the goal: tool point/0.5 m (3),
-    direction (3), roll/pi (1); where the encoders say the tool is: point/0.5 m (3), direction (3); the arm's
-    link lengths/0.25 m (n). Privileged: observation, true q/pi, dq/5 (n each), true pose error (7), hidden
+    Observation (55): q/pi, dq/5, current/rated, previous command (n each); the pose error the encoders see:
+    tool position (3, in POSITION_UNIT), tool direction (3), wrist roll (1), and per joint towards the nearest
+    inverse-kinematics solution (n); the goal: tool point/0.5 m (3), direction (3), roll/pi (1), and that
+    solution/pi (n); where the encoders say the tool is: point/0.5 m (3), direction (3); the arm's link
+    lengths/0.25 m (n). Privileged: observation, true q/pi, dq/5 (n each), true pose error (7), hidden
     condition (10n). Errors are in joint-like units, so the usual 0.03 tolerance means 5 mm and 30 mrad.
     """
 
@@ -234,8 +261,8 @@ class Arm3DEnv(ChainEnv):
         self.nominal_torques = NOMINAL_TORQUES
         self._torque = torch.as_tensor(NOMINAL_TORQUES, dtype=torch.float32, device=self.torch_device)
         self.initial_std = [0.5] * JOINTS
-        self.observation_dim = 4 * self.n + 7 + 7 + 6 + self.n
-        self.error_slice = (4 * self.n, 7)
+        self.observation_dim = 4 * self.n + 7 + self.n + 7 + self.n + 6 + self.n
+        self.error_slice = (4 * self.n, 7 + self.n)
         self.privileged_dim = self.observation_dim + 2 * self.n + 7 + 10 * self.n
 
     def _hidden(self, links: np.ndarray, joints: np.ndarray) -> Tensor:
@@ -308,39 +335,21 @@ class Arm3DEnv(ChainEnv):
 
         return torch.where(self._later(), self._pose_goals[1], self._pose_goals[0])
 
-    def alternatives(self, q: Tensor) -> Tensor:
-        """[W, 4, n]: every joint solution that puts the rigid arm's tool in the same pose (and roll) as `q`.
-
-        Elbow flipped across the line from shoulder to wrist, and the base turned half round with every pitch
-        negated, in all combinations. Some may lie outside the joint limits.
-        """
-
-        upper, lower = self._joint_pos[:, 2, 2], self._joint_pos[:, 3, 2]
-        shoulder, elbow = q[:, 1], q[:, 1] + q[:, 2]
-        line = torch.atan2(upper * torch.sin(shoulder) + lower * torch.sin(elbow), upper * torch.cos(shoulder) + lower * torch.cos(elbow))
-        flipped_shoulder = 2.0 * line - q[:, 1]
-        flipped = torch.stack((q[:, 0], flipped_shoulder, -q[:, 2], q[:, 1] + 2.0 * q[:, 2] + q[:, 3] - flipped_shoulder, q[:, 4]), 1)
-
-        def turned(x: Tensor) -> Tensor:
-            return torch.stack((x[:, 0] + torch.pi, -x[:, 1], -x[:, 2], -x[:, 3], x[:, 4]), 1)
-
-        solutions = torch.stack((q, flipped, turned(q), turned(flipped)), 1)
-        return torch.remainder(solutions + torch.pi, 2.0 * torch.pi) - torch.pi
-
     def joint_goal(self) -> Tensor:
         """Joint angles at which the rigid arm reaches the goal pose; for classical teachers, never for policies.
 
-        Of the solutions within the joint limits, the one nearest the arm's pose when the goal appeared, so a
-        student imitating the teacher can tell from what it senses which one the teacher is heading for.
+        Of the solutions within the joint limits, the one nearest the measured pose when the goal appeared. Policies
+        see how far each joint is from it: the arm's inverse kinematics, worked out from its configured dimensions
+        like the forward kinematics, is a hint; the network still decides how to move and how far to aim past it.
         """
 
         later = self._later()[:, 0]
         stale = self._solution_phase != later
         if stale.any():
-            candidates = self.alternatives(torch.where(later[:, None], self._goals[1], self._goals[0]))
+            candidates = arm3d_inverse(self.goal(), self._joint_pos, self._tip_offset)
             limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device) * 0.97
             valid = ((candidates >= limits[:, 0]) & (candidates <= limits[:, 1])).all(dim=2)
-            here = self._truth[:, :self.n] + self._bias
+            here = self.measured_q
             distance = torch.where(valid, (candidates - here[:, None]).abs().sum(dim=2), torch.inf)
             nearest = candidates[torch.arange(self.worlds, device=self.torch_device), distance.argmin(dim=1)]
             self._solution = torch.where(stale[:, None], nearest, self._solution)
@@ -358,11 +367,11 @@ class Arm3DEnv(ChainEnv):
         raw, n = self._observation, self.n
         self.measured_q, self.velocity = raw[:, :n].clone(), raw[:, n:2 * n].clone()
         point, direction = arm3d_tool(self.measured_q, self._joint_pos, self._axis, self._tip_offset)
-        goal = self.goal()
+        goal, solution = self.goal(), self.joint_goal()
         return torch.cat((self.measured_q / torch.pi, self.velocity / 5.0, raw[:, 2 * n:3 * n] / self._torque, self._previous,
-                          self._pose_error(point, direction, self.measured_q[:, -1]),
-                          goal[:, :3] / 0.5, goal[:, 3:6], goal[:, 6:] / torch.pi, point / 0.5, direction,
-                          self._geometry), dim=1)
+                          self._pose_error(point, direction, self.measured_q[:, -1]), solution - self.measured_q,
+                          goal[:, :3] / 0.5, goal[:, 3:6], goal[:, 6:] / torch.pi, solution / torch.pi,
+                          point / 0.5, direction, self._geometry), dim=1)
 
     def privileged(self, observation: Tensor) -> Tensor:
         n = self.n
