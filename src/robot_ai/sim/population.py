@@ -85,8 +85,12 @@ def sample_population(rng: np.random.Generator, worlds: int, *, severity: float 
 
 def sample_joint_defects(rng: np.random.Generator, worlds: int, joints_per_robot: int, nominal_torques: np.ndarray,
                          limits: np.ndarray, *, severity: float | np.ndarray = 1.0, friction_probability: float = 0.7,
-                         physics_dt: float = 0.001) -> np.ndarray:
-    """Per-joint defects for `worlds` robots with `joints_per_robot` joints each; see `sample_population`."""
+                         physics_dt: float = 0.001, friction_scale: float | np.ndarray = 1.0) -> np.ndarray:
+    """Per-joint defects for `worlds` robots with `joints_per_robot` joints each; see `sample_population`.
+
+    Friction and drag defects are sized for joints rated around 3 N m; `friction_scale` (per joint) resizes
+    them for smaller or larger joints, whose gears and bearings are smaller or larger too.
+    """
 
     shape = (worlds, joints_per_robot)
     severity = _per_world(np.asarray(severity, dtype=np.float64).reshape(-1) if np.ndim(severity) else severity, worlds)[1]
@@ -104,11 +108,11 @@ def sample_joint_defects(rng: np.random.Generator, worlds: int, joints_per_robot
     time_constant = some(0.6, 0.002, 0.040)
     joints["motor_alpha"] = np.where(time_constant > 0, 1.0 - np.exp(-physics_dt / np.maximum(time_constant, 1e-9)), 1.0)
     joints["delay_steps"] = np.rint(some(0.5, 0.0, 0.030) / physics_dt).astype(np.int32)
-    joints["damping"] = BASE_DAMPING + some(0.6, 0.0, 0.10)
-    joints["coulomb"] = some(friction_probability, 0.0, 0.25)
+    joints["damping"] = BASE_DAMPING + some(0.6, 0.0, 0.10) * friction_scale
+    joints["coulomb"] = some(friction_probability, 0.0, 0.25) * friction_scale
     joints["stribeck"] = some(0.5, 0.0, 0.6)
     for bump in ("bump0", "bump1"):
-        joints[f"{bump}_mag"] = some(0.5 * friction_probability, 0.05, 0.40)
+        joints[f"{bump}_mag"] = some(0.5 * friction_probability, 0.05, 0.40) * friction_scale
         joints[f"{bump}_center"] = rng.uniform(limits[:, 0], limits[:, 1], shape)
         joints[f"{bump}_width"] = rng.uniform(0.05, 0.25, shape)
     joints["half_gap"] = some(0.5, 0.002, 0.020)

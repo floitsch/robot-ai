@@ -40,6 +40,8 @@ NOMINAL_TORQUES = np.array([3.0, 8.0, 5.0, 1.5, 0.8])
 LIMITS = np.array([[-2.6, 2.6], [-1.7, 1.7], [-2.4, 2.4], [-2.0, 2.0], [-2.9, 2.9]])
 GOAL_SPAN = np.array([1.6, 1.0, 1.4, 1.4, 2.0])
 TASK_CODE = 3
+# The shared defect model's friction is sized for the planar arm's 3 N m elbow; gears and bearings scale with the joint.
+FRICTION_SCALE = NOMINAL_TORQUES / 3.0
 POSITION_UNIT = 0.005 / TOLERANCE  # m of tool position error that count like 1 rad of joint error: 5 mm ~ 30 mrad
 TABLE_CLEARANCE = 0.03  # goals keep the tool point above the surface the base stands on
 # Largest root bend per link at its motor's rated torque, rad: the stubby base column is much stiffer.
@@ -100,7 +102,7 @@ def sample_arm3d_population(rng: np.random.Generator, worlds: int, *, severity: 
     links["bearing_loss"] = np.where(rng.random(shape) < 0.6, rng.uniform(0.0, 0.15, shape), 0.0) * column
     links["compliance"] = np.where(rng.random(shape) < 0.7, rng.uniform(0.0, 1.0, shape), 0.0) * column * BEND_AT_RATED / NOMINAL_TORQUES
     joints = sample_joint_defects(rng, worlds, JOINTS, NOMINAL_TORQUES, LIMITS, severity=severity,
-                                  friction_probability=friction_probability)
+                                  friction_probability=friction_probability, friction_scale=FRICTION_SCALE)
     joints["enc_bias"] *= 0.1  # homed: +-2 mrad left
     joints["no_load_speed"] = rng.uniform(4.0, 10.0, shape)  # geared hobby motors; a property, not a defect
     return links, joints, tip
@@ -117,7 +119,7 @@ def sample_arm3d_change(rng: np.random.Generator, links: np.ndarray, joints: np.
     shape = (worlds, JOINTS)
     fading = np.where(rng.random(shape) < 0.3, rng.uniform(0.0, 0.4, shape), 0.0) * column
     changed_joints["torque_scale"] = joints["torque_scale"] * (1.0 - fading)
-    changed_joints["coulomb"] = joints["coulomb"] + np.where(rng.random(shape) < 0.3, rng.uniform(0.0, 0.2, shape), 0.0) * column
+    changed_joints["coulomb"] = joints["coulomb"] + np.where(rng.random(shape) < 0.3, rng.uniform(0.0, 0.2, shape), 0.0) * column * FRICTION_SCALE
     return changed_links, changed_joints
 
 
