@@ -323,6 +323,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
           reward_tolerance: float = 0.03, pushes: bool = False, limbs: int = 0, roughness_weight: float | None = None,
           per_limb: bool = False, message: int = 0, severity: float = 1.0, initial: Path | None = None,
           severity_ramp: int = 0, peek: bool = False, identity: bool = False, robot: str = "",
+          critic_warmup: int = 0, initial_noise: float = 0.3, target_kl: float = 0.0,
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
@@ -346,7 +347,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         assert isinstance(head, nn.Linear)
         with torch.no_grad():
             half = head.bias.shape[0] // 2
-            head.bias[half:] = torch.log(torch.tensor(stds[:half], device=dev) * 0.3)
+            head.bias[half:] = torch.log(torch.tensor(stds[:half], device=dev) * initial_noise)
     elif per_limb:
         from .limbs import LimbPolicy
 
@@ -372,9 +373,12 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
     log = (output / "log.jsonl").open("a", encoding="utf-8")
     started = time.perf_counter()
 
+    # With a KL target the step size follows the policy's measured drift instead of a schedule (as rsl_rl does): a
+    # warm-started, precise policy is moved by any fixed rate that is large enough to make progress later on.
+    adaptive_lr = learning_rate * 0.1 if target_kl else learning_rate  # grows once steps prove timid
     for iteration in range(1, iterations + 1):
         for group in optimizer.param_groups:
-            group["lr"] = learning_rate * (1.0 - 0.9 * (iteration - 1) / iterations)
+            group["lr"] = adaptive_lr if target_kl else learning_rate * (1.0 - 0.9 * (iteration - 1) / iterations)
         if severity_ramp:
             # Curriculum within the run: robots go from flawless to the target severity over the first `severity_ramp` iterations.
             env.severity = severity * min(1.0, (iteration - 1) / severity_ramp)
@@ -409,7 +413,10 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
             rollout = _metrics(env.summary())
 
+        drifted, updates = False, 0
         for _ in range(epochs):
+            if drifted:
+                break
             order = torch.randperm(chunks * worlds, device=dev)
             for begin in range(0, len(order), minibatch):
                 picked = order[begin:begin + minibatch]
@@ -420,11 +427,30 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
                                                                          feelings[chunk_index, world_index])
                 policy = torch.distributions.Normal(mean, std)
                 new_log_prob = policy.log_prob(actions[time_index, world_grid]).sum(dim=-1)
-                ratio = (new_log_prob - log_probs[time_index, world_grid]).exp()
+                log_ratio = new_log_prob - log_probs[time_index, world_grid]
+                ratio = log_ratio.exp()
+                if target_kl and iteration > critic_warmup:
+                    with torch.no_grad():
+                        kl = float(((ratio - 1.0) - log_ratio).mean())
+                    if kl > 2.0 * target_kl:
+                        adaptive_lr = max(adaptive_lr / 1.5, 1e-7)
+                    elif kl < 0.5 * target_kl:
+                        adaptive_lr = min(adaptive_lr * 1.5, learning_rate)
+                    for group in optimizer.param_groups:
+                        group["lr"] = adaptive_lr
+                    # A safety net: stop this iteration's updates if the policy has still moved far from the one that
+                    # collected the data.
+                    drifted = kl > 4.0 * target_kl
+                    if drifted:
+                        break
                 advantage = advantages[time_index, world_grid]
                 policy_loss = -torch.minimum(ratio * advantage, ratio.clamp(1 - clip, 1 + clip) * advantage).mean()
                 value_loss = (critic(privileged[time_index, world_grid]).squeeze(-1) - returns[time_index, world_grid]).square().mean()
                 loss = policy_loss + 0.5 * value_loss - entropy * policy.entropy().sum(dim=-1).mean()
+                if iteration <= critic_warmup:
+                    # A warm-started policy is only as good as the advantages that steer it: an untrained critic's
+                    # noise would undo what the policy already knows, so fit values first with the policy frozen.
+                    loss = 0.5 * value_loss
                 if actor.insight is not None:
                     truth = privileged[time_index, world_grid][..., actor.observation_dim:]
                     insight_loss = (actor.insight(features) - truth).square().mean()
@@ -433,10 +459,12 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
                 loss.backward()
                 nn.utils.clip_grad_norm_([*actor.parameters(), *critic.parameters()], 1.0)
                 optimizer.step()
+                updates += 1
 
         record: dict[str, object] = {"iteration": iteration, "elapsed_s": round(time.perf_counter() - started, 1),
                                      "robot_ticks": iteration * worlds * ticks, "std": noise_level,
-                                     "value_loss": value_loss.item(), "rollout": rollout}
+                                     "value_loss": value_loss.item(), "updates": updates, "learning_rate": adaptive_lr,
+                                     "rollout": rollout}
         if actor.insight is not None:
             record["insight_loss"] = insight_loss.item()
         if iteration % eval_every == 0 or iteration == iterations:
@@ -590,6 +618,11 @@ def main() -> None:
     fit.add_argument("--severity", type=float, default=1.0, help="0 = healthy robots, 1 = the full defect population")
     fit.add_argument("--initial", type=Path, help="warm-start from this run (curriculum)")
     fit.add_argument("--severity-ramp", type=int, default=0, help="ramp severity from 0 to --severity over this many iterations")
+    fit.add_argument("--target-kl", type=float, default=0.0,
+                     help="adapt the step size to keep each update's KL from the rollout policy near this (up to --learning-rate)")
+    fit.add_argument("--critic-warmup", type=int, default=0, help="with --initial: train only the critic for this many iterations")
+    fit.add_argument("--initial-noise", type=float, default=0.3,
+                     help="with --initial: exploration as a fraction of the task's initial noise level")
     fit.add_argument("--reward-tolerance", type=float, default=0.03,
                      help="train against a stricter tolerance than the 0.03 rad success criterion")
     fit.add_argument("--insight-weight", type=float, default=0.0,
@@ -646,6 +679,7 @@ def main() -> None:
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
               severity=args.severity, initial=args.initial, minibatch=args.minibatch, severity_ramp=args.severity_ramp,
+              critic_warmup=args.critic_warmup, initial_noise=args.initial_noise, target_kl=args.target_kl,
               learning_rate=args.learning_rate,
               peek=args.peek, identity=args.identity, robot="" if args.robot == "planar" else args.robot,
               output=args.output, device=args.device, worlds=args.worlds,
