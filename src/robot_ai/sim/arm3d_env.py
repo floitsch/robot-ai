@@ -268,7 +268,8 @@ class Arm3DEnv(ChainEnv):
 
     def __init__(self, worlds: int, *, device: str = "cuda:0", seed: int = 0, severity: float = 1.0,
                  episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
-                 still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False, servo: bool = False) -> None:
+                 still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False, servo: bool = False,
+                 hold_weight: float = 0.0) -> None:
         self.worlds, self.limbs, self.n, self.limb_joints = worlds, 1, JOINTS, JOINTS
         # Mixed: every robot gets its own severity, from flawless to `severity`, so training on worn arms does not
         # cost precision on good ones.
@@ -277,6 +278,9 @@ class Arm3DEnv(ChainEnv):
         # targets around the inverse-kinematics solution; otherwise it commands torque directly.
         self.servo = servo
         self.task_code = TASK_CODE + 1 if servo else TASK_CODE
+        # Hold: an L1 charge on every change of the commanded targets. Unlike the squared roughness charge it makes
+        # exactly-still targets worth having: a servo follows even a 1 mrad jitter, and a worn one never settles.
+        self.hold_weight = hold_weight
         self.device, self.severity, self.episode_ticks, self.changes = device, severity, episode_ticks, changes
         self.reward_tolerance, self.still_weight, self.roughness_weight = reward_tolerance, still_weight, roughness_weight
         self.rng = np.random.default_rng([seed, 3000 + JOINTS])
@@ -351,6 +355,7 @@ class Arm3DEnv(ChainEnv):
         self.tick = 0
         self._previous = torch.zeros((self.worlds, self.n), device=self.torch_device)
         self._previous_smooth = torch.zeros((self.worlds, self.n), device=self.torch_device)
+        self._previous_hold = torch.zeros((self.worlds, self.n), device=self.torch_device)
         zeros = torch.zeros(self.worlds, device=self.torch_device)
         self._sum_error, self._sum_rough, self._return = zeros.clone(), zeros.clone(), zeros.clone()
         self._window_error = torch.zeros((self.worlds, self.components), device=self.torch_device)
@@ -431,6 +436,9 @@ class Arm3DEnv(ChainEnv):
         scale = 2.0 / n
         reward = 0.1 * (-error.sum(dim=1) * (2.0 / self.components) + close + arrived - self.roughness_weight * rough * scale
                         - 0.002 * self._metrics[:, 0] / 0.01 * scale - limit * scale)
+        if self.hold_weight:
+            reward = reward - 0.1 * self.hold_weight * (smooth - self._previous_hold).abs().sum(dim=1) * scale
+        self._previous_hold = smooth
         if self.still_weight:
             reward = reward + 0.1 * self.still_weight * (close * torch.exp(-speed.amax(dim=1) / (2.0 * SETTLED_SPEED))
                                                          - 0.2 * speed.mean(dim=1))

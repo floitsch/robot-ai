@@ -313,7 +313,7 @@ def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, robot: str 
         from ..sim.arm3d_env import Arm3DEnv
 
         return Arm3DEnv(worlds, device=device, seed=seed, servo=robot == "arm3d-servo",
-                        **{k: v for k, v in settings.items() if k in allowed | {"mixed"}})  # type: ignore[arg-type,return-value]
+                        **{k: v for k, v in settings.items() if k in allowed | {"mixed", "hold_weight"}})  # type: ignore[arg-type,return-value]
     if limbs:
         return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
     return ReachEnv(worlds, device=device, seed=seed, **settings)  # type: ignore[arg-type]
@@ -325,12 +325,13 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
           reward_tolerance: float = 0.03, pushes: bool = False, limbs: int = 0, roughness_weight: float | None = None,
           per_limb: bool = False, message: int = 0, severity: float = 1.0, initial: Path | None = None,
           severity_ramp: int = 0, peek: bool = False, identity: bool = False, robot: str = "",
-          critic_warmup: int = 0, initial_noise: float = 0.3, target_kl: float = 0.0,
+          critic_warmup: int = 0, initial_noise: float = 0.3, target_kl: float = 0.0, hold_weight: float = 0.0,
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
     # Only explicitly set weights are passed on, so each task keeps its own defaults.
     weights = {k: v for k, v in (("still_weight", still_weight or None), ("roughness_weight", roughness_weight)) if v is not None}
+    weights.update({"hold_weight": hold_weight} if hold_weight else {})
     env = make_env(worlds, device=device, seed=seed, limbs=limbs, robot=robot, friction_probability=friction_probability, mixed=mixed,
                    reward_tolerance=reward_tolerance, pushes=pushes, severity=severity, **weights)
     dev = env.torch_device
@@ -622,6 +623,8 @@ def main() -> None:
     fit.add_argument("--severity-ramp", type=int, default=0, help="ramp severity from 0 to --severity over this many iterations")
     fit.add_argument("--target-kl", type=float, default=0.0,
                      help="adapt the step size to keep each update's KL from the rollout policy near this (up to --learning-rate)")
+    fit.add_argument("--hold-weight", type=float, default=0.0,
+                     help="3D arms: L1 charge on every change of the commanded targets, so settled targets stay put")
     fit.add_argument("--critic-warmup", type=int, default=0, help="with --initial: train only the critic for this many iterations")
     fit.add_argument("--initial-noise", type=float, default=0.3,
                      help="with --initial: exploration as a fraction of the task's initial noise level")
@@ -681,7 +684,7 @@ def main() -> None:
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
               severity=args.severity, initial=args.initial, minibatch=args.minibatch, severity_ramp=args.severity_ramp,
-              critic_warmup=args.critic_warmup, initial_noise=args.initial_noise, target_kl=args.target_kl,
+              critic_warmup=args.critic_warmup, initial_noise=args.initial_noise, target_kl=args.target_kl, hold_weight=args.hold_weight,
               learning_rate=args.learning_rate,
               peek=args.peek, identity=args.identity, robot="" if args.robot == "planar" else args.robot,
               output=args.output, device=args.device, worlds=args.worlds,
