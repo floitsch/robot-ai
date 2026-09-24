@@ -251,8 +251,11 @@ class Arm3DEnv(ChainEnv):
 
     def __init__(self, worlds: int, *, device: str = "cuda:0", seed: int = 0, severity: float = 1.0,
                  episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
-                 still_weight: float = 1.0, roughness_weight: float = 4.0) -> None:
+                 still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False) -> None:
         self.worlds, self.limbs, self.n, self.limb_joints = worlds, 1, JOINTS, JOINTS
+        # Mixed: every robot gets its own severity, from flawless to `severity`, so training on worn arms does not
+        # cost precision on good ones.
+        self.mixed = mixed
         self.device, self.severity, self.episode_ticks, self.changes = device, severity, episode_ticks, changes
         self.reward_tolerance, self.still_weight, self.roughness_weight = reward_tolerance, still_weight, roughness_weight
         self.rng = np.random.default_rng([seed, 3000 + JOINTS])
@@ -288,8 +291,9 @@ class Arm3DEnv(ChainEnv):
         return q
 
     def reset(self) -> Tensor:
-        links, joints, tip = sample_arm3d_population(self.rng, self.worlds, severity=self.severity)
-        changed = sample_arm3d_change(self.rng, links, joints, tip, severity=self.severity)
+        severity = self.rng.uniform(0.0, self.severity, self.worlds) if self.mixed else self.severity
+        links, joints, tip = sample_arm3d_population(self.rng, self.worlds, severity=severity)
+        changed = sample_arm3d_change(self.rng, links, joints, tip, severity=severity)
         ticks = self.episode_ticks
         change_tick = np.where(self.rng.random(self.worlds) < (0.5 if self.changes else 0.0),
                                self.rng.integers(20, ticks - 60, self.worlds), np.iinfo(np.int32).max)

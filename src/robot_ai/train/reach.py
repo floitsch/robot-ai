@@ -311,7 +311,7 @@ def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, robot: str 
     if robot == "arm3d":
         from ..sim.arm3d_env import Arm3DEnv
 
-        return Arm3DEnv(worlds, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
+        return Arm3DEnv(worlds, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed | {"mixed"}})  # type: ignore[arg-type,return-value]
     if limbs:
         return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
     return ReachEnv(worlds, device=device, seed=seed, **settings)  # type: ignore[arg-type]

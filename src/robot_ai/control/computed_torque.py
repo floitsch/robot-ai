@@ -66,7 +66,7 @@ class ComputedTorqueTeacher(nn.Module):
     """Presents the oracle interface used by distillation, but reads the environment's truth directly."""
 
     def __init__(self, env: ChainEnv, *, omega: float = 15.0, seconds_per_rad: float = 0.5, measured: bool = False,
-                 ramp: bool = True, friction: bool = False) -> None:
+                 ramp: bool = True, friction: bool = False, integral: float = 0.0) -> None:
         super().__init__()
         self.env = env
         self.kp, self.kd = omega * omega, 2.0 * omega
@@ -80,6 +80,10 @@ class ComputedTorqueTeacher(nn.Module):
         # Feed forward the known dry friction (Coulomb, breakaway bump and angle-local rubbing) against the intended
         # direction of motion; the simulator's bound is the same expression as its `friction_bound`.
         self.friction = friction
+        # Integral action, as a fraction of the (s + omega)^3 pole placement's gain: it pushes through stiction and
+        # unmodelled load that the rigid-body model does not know. Winds up only near the goal, restarts with each goal.
+        self.integral = integral
+        self.ki = integral * omega**3
         self.n = env.n
         self.observation_dim = env.observation_dim
         self.privileged_dim = torch.tensor(env.privileged_dim)
@@ -89,8 +93,9 @@ class ComputedTorqueTeacher(nn.Module):
         self.hidden = 0
 
     def initial(self, worlds: int, device: torch.device) -> Tensor:
-        # Reference state per world: goal seen last (n), move origin (n), elapsed (1), duration (1); NaN goal = unset.
-        state = torch.zeros((worlds, 2 * self.n + 2), device=device)
+        # Reference state per world: goal seen last (n), move origin (n), elapsed (1), duration (1), error integral (n);
+        # NaN goal = unset.
+        state = torch.zeros((worlds, 3 * self.n + 2), device=device)
         state[:, :self.n] = torch.nan
         return state
 
@@ -111,6 +116,7 @@ class ComputedTorqueTeacher(nn.Module):
         q = q_true + bias  # the controller reasons in encoder units, where the goal is given
         fb_q, fb_dq = (env.measured_q, env.velocity) if self.measured else (q, dq_true)
         seen, origin, elapsed, duration = feeling[:, :n], feeling[:, n:2 * n], feeling[:, 2 * n], feeling[:, 2 * n + 1]
+        accumulated = feeling[:, 2 * n + 2:]
         moved = (goal != seen).any(dim=1) | torch.isnan(seen).any(dim=1)
         origin = torch.where(moved[:, None], q, origin)
         elapsed = torch.where(moved, torch.zeros_like(elapsed), elapsed + 0.01)
@@ -123,7 +129,10 @@ class ComputedTorqueTeacher(nn.Module):
         ref_a = delta * acc[:, None] / duration[:, None] ** 2
         if not self.ramp:
             ref, ref_v, ref_a = goal, torch.zeros_like(goal), torch.zeros_like(goal)
-        desired = ref_a + self.kp * (ref - fb_q) + self.kd * (ref_v - fb_dq)
+        error = ref - fb_q
+        accumulated = torch.where(moved[:, None], torch.zeros_like(accumulated), accumulated)
+        accumulated = torch.where(error.abs() < 0.1, (accumulated + 0.01 * error).clamp(-0.05, 0.05), accumulated)
+        desired = ref_a + self.kp * error + self.kd * (ref_v - fb_dq) + self.ki * accumulated
         torque_scale, damping = env.true_actuation(device)
         m, dyn_bias = env.true_dynamics(q_true, dq_true)
         torque = torch.einsum("wij,wj->wi", m, desired) + dyn_bias + damping * dq_true
@@ -131,7 +140,7 @@ class ComputedTorqueTeacher(nn.Module):
             intent = torch.where(fb_dq.abs() > 0.05, fb_dq, (ref - fb_q) * 2.0)
             torque = torque + self._friction_bound(q_true, dq_true, device) * torch.tanh(intent / 0.05)
         command = (torque / torque_scale).clamp(-1.0, 1.0)
-        next_feeling = torch.cat((goal, origin, elapsed[:, None], duration[:, None]), dim=1)
+        next_feeling = torch.cat((goal, origin, elapsed[:, None], duration[:, None], accumulated), dim=1)
         return command[None], next_feeling
 
     def distribution(self, observations: Tensor, feeling: Tensor) -> tuple[Tensor, Tensor, Tensor]:
