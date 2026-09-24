@@ -329,3 +329,12 @@ def test_a_softer_servo_sags_further_under_the_same_load() -> None:
         batch.step(np.tile(pose, (2, 1)), stiffness)
     sag = np.abs(batch.truth.numpy()[:, 1] - pose[1])
     assert 1.6 < sag[1] / sag[0] < 2.4  # a proportional servo's droop is inversely proportional to its gain
+
+
+def test_a_stiffness_network_steps_with_twice_as_many_actions() -> None:
+    env = Arm3DEnv(8, device="cpu", seed=2, severity=0.5, servo=True, stiffness=True)
+    observation = env.reset()
+    assert env.action_dim == 2 * JOINTS and observation.shape == (8, env.observation_dim)
+    for _ in range(5):
+        observation, reward = env.step(torch.zeros(8, env.action_dim), reference=torch.zeros(8, env.action_dim))
+    assert torch.isfinite(reward).all()

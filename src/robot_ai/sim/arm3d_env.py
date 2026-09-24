@@ -358,8 +358,8 @@ class Arm3DEnv(ChainEnv):
         self._tool_axis = wp.to_torch(self.batch.tool_axis)
         self.tick = 0
         self._previous = torch.zeros((self.worlds, self.n), device=self.torch_device)
-        self._previous_smooth = torch.zeros((self.worlds, self.n), device=self.torch_device)
-        self._previous_hold = torch.zeros((self.worlds, self.n), device=self.torch_device)
+        self._previous_smooth = torch.zeros((self.worlds, self.action_dim), device=self.torch_device)
+        self._previous_hold = torch.zeros((self.worlds, self.action_dim), device=self.torch_device)
         zeros = torch.zeros(self.worlds, device=self.torch_device)
         self._sum_error, self._sum_rough, self._return = zeros.clone(), zeros.clone(), zeros.clone()
         self._window_error = torch.zeros((self.worlds, self.components), device=self.torch_device)
