@@ -22,14 +22,26 @@ from .animate import _font
 
 COLORS = {"classical": (42, 120, 214), "network": (27, 175, 122)}
 LABELS = {"classical": "Computed torque (perfect knowledge)", "network": "Our network (told only the arm's size)"}
+SERVO_LABELS = {"classical": "Servos sent the IK angles", "network": "Our network (told only the arm's size)"}
+
+
+class IkTargets(torch.nn.Module):
+    """Servo arms without a network: every joint's target is the inverse-kinematics solution, as LeRobot users send."""
+
+    def initial(self, worlds: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros((worlds, 1), device=device)
+
+    def forward(self, observations: torch.Tensor, feeling: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return torch.zeros((*observations.shape[:-1], 5), device=observations.device), feeling
 AZIMUTH, ELEVATION = np.radians(-50.0), np.radians(22.0)
 
 
 @torch.no_grad()
-def record(controller: object, *, worlds: int, device: str, severity: float = 1.0) -> tuple[Arm3DEnv, dict[str, np.ndarray]]:
+def record(controller: object, *, worlds: int, device: str, severity: float = 1.0,
+           servo: bool = False) -> tuple[Arm3DEnv, dict[str, np.ndarray]]:
     """Per tick: joint origins and tool point [ticks, worlds, n + 1, 3], tool direction, goal pose, pose error."""
 
-    env = Arm3DEnv(worlds, device=device, seed=EVAL_SEED, severity=severity)
+    env = Arm3DEnv(worlds, device=device, seed=EVAL_SEED, severity=severity, servo=servo)
     observation = env.reset()
     if callable(controller) and not isinstance(controller, torch.nn.Module):
         controller = controller(env)  # type: ignore[operator]
@@ -149,10 +161,15 @@ def main() -> None:
     def classical(env: Arm3DEnv) -> ComputedTorqueTeacher:
         return ComputedTorqueTeacher(env, omega=15.0, measured=False, ramp=True).to(device)
 
-    env, first = record(classical, worlds=args.worlds, device=args.device, severity=args.severity)
+    network = load_actor(args.run, device) if args.run else None
+    servo = network is not None and network.task == 4
+    if servo:
+        LABELS.update(SERVO_LABELS)
+    baseline: object = IkTargets() if servo else classical
+    env, first = record(baseline, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo)
     runs = {"classical": first}
-    if args.run:
-        runs["network"] = record(load_actor(args.run, device), worlds=args.worlds, device=args.device, severity=args.severity)[1]
+    if network is not None:
+        runs["network"] = record(network, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo)[1]
     picks = pick_robots(env)
     render_gif(runs, picks, args.gif)
     for index, title in picks:
