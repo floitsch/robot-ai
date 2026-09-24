@@ -84,7 +84,22 @@ robot (knowledge no real controller has), measured on 4,096 robots:
 | Defective, changing mid-move | 1.9% | 14.5 mm, 68 mrad |
 
 Perfect knowledge of the rigid-body dynamics does not help against dry friction without integral action,
-gear slack, latency, load drag and sag. The network has to close that gap.
+gear slack, latency, load drag and sag.
+
+The controller a cheap-arm builder would actually write (`src/robot_ai/control/pid3d.py`) is told exactly
+what the network is told. It does inverse kinematics to joint targets, follows a minimum-jerk reference,
+and runs per-joint PID with anti-windup and gravity compensation from the catalogue masses. Its gains are
+scheduled on each joint's nominal inertia and tuned on defective arms (bandwidth 20 rad/s, damping ratio
+0.7, integral rate 0.1, 0.25 s per radian of travel).
+
+| Robots | Success | Median tool error |
+| --- | --- | --- |
+| Healthy | 41% | 2.7 mm, 9 mrad |
+| Defective | 3.3% | 54 mm, 215 mrad |
+
+Even on healthy arms, half its failures are the three pitch joints still moving at the end. Per-joint
+control ignores how strongly the shoulder, elbow and wrist pitch drive each other in 3D, and higher gains
+saturate and oscillate. The network has to close that gap.
 
 ### Inverse kinematics: computed, not learned
 
