@@ -33,7 +33,7 @@ EVAL_SEED = 987_654_321
 FINE_ERROR_SCALES = (0.05, 0.5)
 ORACLE_FULL, ORACLE_CONDITION = 1, 2
 # The 3D arm's task codes (`arm3d_env.TASK_CODE`, + 1 with position servos), saved in an Actor's layout.
-ROBOT_BY_TASK = {3: "arm3d", 4: "arm3d-servo"}
+ROBOT_BY_TASK = {3: "arm3d", 4: "arm3d-servo", 5: "arm3d-servo-stiff"}
 # Per joint: the observation holds 6 blocks (q, dq, current, goal, error, previous command); the privileged
 # part starts with true q and dq. The single arm has 2 joints; chains have more.
 OBSERVATION_BLOCKS = 6
@@ -238,6 +238,27 @@ def widen_to_oracle(student: Actor, privileged_dim: int, initial_std: Sequence[f
     return oracle
 
 
+def widen_actions(actor: Actor, action_dim: int, layout: list[int] | None) -> Actor:
+    """The same policy with more outputs: new commands start at 0 (for servo stiffness: as tuned), with the old noise."""
+
+    wider = Actor(recurrent=actor.recurrent, incremental=bool(actor.incremental), fine_scales=actor.fine_scales.tolist(),
+                  hidden=actor.hidden, oracle=int(actor.oracle), insight=actor.insight is not None,
+                  history=int(actor.history), joints=action_dim, privileged_dim=int(actor.privileged_dim),
+                  layout=layout).to(actor.head.weight.device)
+    state = {k: v for k, v in actor.state_dict().items() if not k.startswith("head.") and k not in ("joints", "layout")}
+    wider.load_state_dict(state, strict=False)
+    n = actor.n
+    with torch.no_grad():
+        wider.head.weight.zero_()
+        wider.head.bias.zero_()
+        wider.head.weight[:n] = actor.head.weight[:n]
+        wider.head.bias[:n] = actor.head.bias[:n]
+        wider.head.weight[action_dim:action_dim + n] = actor.head.weight[n:]
+        wider.head.bias[action_dim:action_dim + n] = actor.head.bias[n:]
+        wider.head.bias[action_dim + n:] = actor.head.bias[n:].mean()
+    return wider
+
+
 def env_privileged_dim(env: object) -> int:
     return int(getattr(env, "privileged_dim", PRIVILEGED_DIM))
 
@@ -312,7 +333,7 @@ def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, robot: str 
     if robot.startswith("arm3d"):
         from ..sim.arm3d_env import Arm3DEnv
 
-        return Arm3DEnv(worlds, device=device, seed=seed, servo=robot == "arm3d-servo",
+        return Arm3DEnv(worlds, device=device, seed=seed, servo=robot.startswith("arm3d-servo"), stiffness=robot == "arm3d-servo-stiff",
                         **{k: v for k, v in settings.items() if k in allowed | {"mixed", "hold_weight"}})  # type: ignore[arg-type,return-value]
     if limbs:
         return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
@@ -339,7 +360,10 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
     if initial:
         # Curriculum: continue a policy trained under easier conditions, e.g. healthy robots before defective ones.
         actor = load_actor(initial, dev).train()
-        if actor.n != getattr(env, "n", 2):
+        action_dim = getattr(env, "action_dim", getattr(env, "n", 2))
+        if actor.n < action_dim and isinstance(actor, Actor) and actor.task + 1 == getattr(env, "task_code", 0):
+            actor = widen_actions(actor, action_dim, env_layout(env)).train()
+        if actor.n != action_dim:
             raise ValueError("the initial policy was trained for a different joint count")
         if oracle and not int(actor.oracle):
             actor = widen_to_oracle(actor, env_privileged_dim(env), getattr(env, "initial_std", None)).train()
@@ -360,7 +384,8 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
                            initial_std=getattr(env, "initial_std", None), peek=peek, identity=identity).to(dev)  # type: ignore[assignment]
     else:
         actor = Actor(recurrent=recurrent, incremental=incremental, fine_scales=fine_scales, hidden=hidden, oracle=oracle,
-                      insight=insight_weight > 0, joints=getattr(env, "n", 2), privileged_dim=env_privileged_dim(env),
+                      insight=insight_weight > 0, joints=getattr(env, "action_dim", getattr(env, "n", 2)),
+                      privileged_dim=env_privileged_dim(env),
                       initial_std=getattr(env, "initial_std", None), layout=env_layout(env)).to(dev)
     critic = make_critic(env_privileged_dim(env)).to(dev)
     optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=learning_rate)
@@ -666,8 +691,9 @@ def main() -> None:
         sub.add_argument("--identity", action="store_true", help="each limb is told its slot in the chain (per-limb only)")
 
     for sub in (fit, teach):
-        sub.add_argument("--robot", choices=("planar", "arm3d", "arm3d-servo"), default="planar",
-                         help="arm3d: five-joint 3D arms with tool-pose goals, driven by torque or by position servos")
+        sub.add_argument("--robot", choices=("planar", "arm3d", "arm3d-servo", "arm3d-servo-stiff"), default="planar",
+                         help="arm3d: five-joint 3D arms with tool-pose goals, driven by torque, by position servos, or by "
+                              "position servos whose stiffness the network also sets")
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")
         sub.add_argument("--pushes", action="store_true", help="train with neighbour pushes at full severity")
     compare = commands.add_parser("report")

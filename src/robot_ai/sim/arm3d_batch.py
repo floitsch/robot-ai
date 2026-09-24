@@ -110,6 +110,8 @@ def _step_tick(
     states: wp.array2d(dtype=JointState),
     commands: wp.array2d(dtype=wp.float32),
     command_ring: wp.array3d(dtype=wp.float32),
+    stiffness: wp.array2d(dtype=wp.float32),
+    stiffness_ring: wp.array3d(dtype=wp.float32),
     encoder_ring: wp.array3d(dtype=wp.float32),
     ticks: wp.array(dtype=wp.int32),
     rng: wp.array(dtype=wp.uint32),
@@ -139,6 +141,7 @@ def _step_tick(
     changed = tick >= change_tick[w]
     g = gravity[w]
     for j in range(n):
+        stiffness_ring[w, j, tick % RING_DEPTH] = stiffness[w, j]
         if params[w, j].servo_gain > 0.0:
             command_ring[w, j, tick % RING_DEPTH] = commands[w, j]  # a target angle
         else:
@@ -154,6 +157,8 @@ def _step_tick(
         for j in range(n):
             p = _joint(params, changed_params, w, j, changed)
             s = states[w, j]
+            # A servo's stiffness (its gain register) is set by the host too, and arrives as late as its target.
+            p.servo_gain = p.servo_gain * _delayed_command(stiffness_ring, w, j, tick, substep, substeps, p.delay_steps)
             s = drive_joint(p, s, _delayed_command(command_ring, w, j, tick, substep, substeps, p.delay_steps), dt)
             states[w, j] = s
             scratch[w, 7, j] = scratch[w, 7, j] + s.motor_torque
@@ -393,6 +398,7 @@ def _reset(
     metrics: wp.array2d(dtype=wp.float32),
     bend: wp.array2d(dtype=wp.vec3),
     scratch: wp.array3d(dtype=wp.float32),
+    stiffness_ring: wp.array3d(dtype=wp.float32),
 ):
     w = wp.tid()
     if mask[w] == 0:
@@ -413,6 +419,7 @@ def _reset(
             s.servo_prev = hold
         for k in range(RING_DEPTH):
             command_ring[w, j, k] = hold
+            stiffness_ring[w, j, k] = 1.0
             encoder_ring[w, j, k] = reading
         states[w, j] = s
         observation[w, j] = reading
@@ -473,6 +480,8 @@ class Arm3DBatch:
         self.push = wp.array(waves, dtype=wp.float32, device=device)
         self.states = wp.zeros((w, n), dtype=JointState, device=device)
         self.command_ring = wp.zeros((w, n, RING_DEPTH), dtype=wp.float32, device=device)
+        self.stiffness_ring = wp.ones((w, n, RING_DEPTH), dtype=wp.float32, device=device)
+        self.nominal_stiffness = wp.ones((w, n), dtype=wp.float32, device=device)
         self.encoder_ring = wp.zeros((w, n, RING_DEPTH), dtype=wp.float32, device=device)
         self.ticks = wp.zeros(w, dtype=wp.int32, device=device)
         streams = np.random.default_rng(seed).integers(1, 2**32, w, dtype=np.uint32)
@@ -503,19 +512,24 @@ class Arm3DBatch:
         start = np.ascontiguousarray(np.broadcast_to(np.asarray(start_q, dtype=np.float32), (self.worlds, self.joints)))
         wp.launch(_reset, dim=self.worlds, device=self.device,
                   inputs=[self.joints, wp.array(mask_values, device=self.device), wp.array(start, device=self.device), *self._shared,
-                          self.bend, self.scratch])
+                          self.bend, self.scratch, self.stiffness_ring])
 
-    def step(self, commands: object) -> None:
-        if isinstance(commands, np.ndarray):
-            source = wp.array(np.ascontiguousarray(commands, dtype=np.float32), device=self.device)
-        else:
-            source = wp.from_torch(commands.detach().contiguous())  # type: ignore[attr-defined]
-        if source.shape != (self.worlds, self.joints):
-            raise ValueError("commands must have shape [worlds, joints]")
+    def step(self, commands: object, stiffness: object = None) -> None:
+        """`stiffness` [worlds, joints] scales each position servo's gain (1 = as tuned); ignored by torque drives."""
+
+        def device_array(values: object) -> wp.array:
+            if isinstance(values, np.ndarray):
+                return wp.array(np.ascontiguousarray(values, dtype=np.float32), device=self.device)
+            return wp.from_torch(values.detach().contiguous())  # type: ignore[attr-defined]
+
+        source = device_array(commands)
+        scale = self.nominal_stiffness if stiffness is None else device_array(stiffness)
+        if source.shape != (self.worlds, self.joints) or scale.shape != (self.worlds, self.joints):
+            raise ValueError("commands and stiffness must have shape [worlds, joints]")
         wp.launch(_step_tick, dim=self.worlds, device=self.device,
                   inputs=[self.joints, self.links, self.changed_links, self.change_tick, self.tip_offset, self.gravity,
                           self.params, self.changed_params, self.push, self.states, source, self.command_ring,
-                          self.encoder_ring, self.ticks, self.rng, self.rot, self.origin, self.axis_world, self.centre,
+                          scale, self.stiffness_ring, self.encoder_ring, self.ticks, self.rng, self.rot, self.origin, self.axis_world, self.centre,
                           self.omega, self.force, self.moment, self.load_force, self.load_moment, self.bend, self.mass, self.inverse, self.scratch, self.observation,
                           self.truth, self.tip, self.tool_axis, self.metrics, self.physics_dt, self.substeps])
 

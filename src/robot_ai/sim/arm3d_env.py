@@ -269,7 +269,7 @@ class Arm3DEnv(ChainEnv):
     def __init__(self, worlds: int, *, device: str = "cuda:0", seed: int = 0, severity: float = 1.0,
                  episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
                  still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False, servo: bool = False,
-                 hold_weight: float = 0.0) -> None:
+                 hold_weight: float = 0.0, stiffness: bool = False) -> None:
         self.worlds, self.limbs, self.n, self.limb_joints = worlds, 1, JOINTS, JOINTS
         # Mixed: every robot gets its own severity, from flawless to `severity`, so training on worn arms does not
         # cost precision on good ones.
@@ -277,7 +277,11 @@ class Arm3DEnv(ChainEnv):
         # Servo: the joints are position servos, as on nearly every cheap arm, and the policy's action moves their
         # targets around the inverse-kinematics solution; otherwise it commands torque directly.
         self.servo = servo
-        self.task_code = TASK_CODE + 1 if servo else TASK_CODE
+        # Stiffness: a second action per joint scales that servo's gain by 2^action (0.5-2x), the gain register LeRobot
+        # lowers "to avoid shakiness"; the network may soften a hunting servo while it holds.
+        self.stiffness = stiffness and servo
+        self.task_code = TASK_CODE + (2 if self.stiffness else 1 if servo else 0)
+        self.action_dim = 2 * self.n if self.stiffness else self.n
         # Hold: an L1 charge on every change of the commanded targets. Unlike the squared roughness charge it makes
         # exactly-still targets worth having: a servo follows even a 1 mrad jitter, and a worn one never settles.
         self.hold_weight = hold_weight
@@ -290,7 +294,7 @@ class Arm3DEnv(ChainEnv):
             wp.set_stream(wp.stream_from_torch(torch.cuda.current_stream(self.torch_device)), device)
         self.nominal_torques = NOMINAL_TORQUES
         self._torque = torch.as_tensor(NOMINAL_TORQUES, dtype=torch.float32, device=self.torch_device)
-        self.initial_std = [0.3 if servo else 0.5] * JOINTS
+        self.initial_std = [0.3 if servo else 0.5] * self.action_dim
         self.observation_dim = 4 * self.n + 7 + self.n + 7 + self.n + 6 + self.n
         self.error_slice = (4 * self.n, 7 + self.n)
         self.privileged_dim = self.observation_dim + 2 * self.n + 7 + 12 * self.n
@@ -420,7 +424,8 @@ class Arm3DEnv(ChainEnv):
         smooth = action if reference is None else reference.clamp(-1.0, 1.0)
         if self.servo:
             limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device)
-            self.batch.step(torch.maximum(torch.minimum(self.joint_goal() + SERVO_REACH * action, limits[:, 1]), limits[:, 0]))
+            targets = torch.maximum(torch.minimum(self.joint_goal() + SERVO_REACH * action[:, :n], limits[:, 1]), limits[:, 0])
+            self.batch.step(targets, torch.exp2(action[:, n:]) if self.stiffness else None)
         else:
             self.batch.step(action)
         self.tick += 1
@@ -442,7 +447,7 @@ class Arm3DEnv(ChainEnv):
         if self.still_weight:
             reward = reward + 0.1 * self.still_weight * (close * torch.exp(-speed.amax(dim=1) / (2.0 * SETTLED_SPEED))
                                                          - 0.2 * speed.mean(dim=1))
-        self._previous = action
+        self._previous = action[:, :n]
         self._sum_error += error.mean(dim=1)
         self._sum_rough += rough * scale
         self._return += reward

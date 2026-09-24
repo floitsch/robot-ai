@@ -315,3 +315,17 @@ def test_servo_arms_reach_healthy_goals_with_the_inverse_kinematics_targets_alon
     summary = env.summary()
     # Proportional servos sag under load, so this is a baseline, not a solution: most arms end near the goal.
     assert summary.position_error.median() < 0.02
+
+
+def test_a_softer_servo_sags_further_under_the_same_load() -> None:
+    links, tip = _arm(2)
+    joints = _servo_joints(2)
+    joints["servo_deadband"] = 0.0
+    pose = np.array([0.0, 1.2, 0.3, 0.0, 0.0], dtype=np.float32)
+    batch = Arm3DBatch(links, joints, tip, device="cpu")
+    batch.reset(pose)
+    stiffness = np.array([[1.0] * JOINTS, [0.5] * JOINTS], dtype=np.float32)
+    for _ in range(150):
+        batch.step(np.tile(pose, (2, 1)), stiffness)
+    sag = np.abs(batch.truth.numpy()[:, 1] - pose[1])
+    assert 1.6 < sag[1] / sag[0] < 2.4  # a proportional servo's droop is inversely proportional to its gain
