@@ -128,3 +128,66 @@ to aim past the rigid solution so that a sagging arm ends up on target.
 
 The distilled network, which reads only the robot's imperfect sensors, has 0% success on defective
 arms (median 38 mm). It is the starting point for training on them.
+
+## Position servos: the interface cheap arms actually have
+
+Nearly every cheap arm drives its joints with position servos: hobby servos, the Feetech STS3215 in
+the SO-100/SO-101, Dynamixels and closed-loop steppers all do. You send each joint a target angle, and
+a loop inside the servo, running around 1 kHz, tracks it using the servo's own encoder
+([research notes](RESEARCH_ACTION_SPACE.md)). None of them lets a computer command torque at 100 Hz,
+which is what the network above did. Torque control also had two problems of its own:
+- On worn arms, up to about 100 ms of delay (encoder, command, motor) sat inside the loop that holds the
+  arm, so every controller had to be slow.
+- Reacting to encoder noise at 100 Hz made the light wrist joints buzz.
+
+The simulator now models a position servo in every joint. Once per 1 ms physics step it:
+- reads its own undelayed 12-bit encoder;
+- computes a PWM duty from the target error and its filtered velocity, with a deadband;
+- drives the motor through back-EMF and a current limit.
+
+Gains vary per joint over a 4× range, as between LeRobot's and Feetech's default settings. Host command
+latency and encoder defects stay where they are, but now they only delay how fast targets change, not
+the servo's own loop.
+
+The network's action moves each target by up to ±0.3 rad around the inverse-kinematics solution. A
+network that does nothing sends the inverse-kinematics angles unchanged, which is what LeRobot users do.
+That is the baseline.
+
+### Results
+
+The network trains with PPO starting from "send the inverse-kinematics angles":
+- robots of mixed severity, with defects ramped in over 200 iterations;
+- a critic warm-up, and a step size that follows the measured KL.
+
+It ran 1,500 iterations, 6 hours on a GTX 1650. Final evaluation on 4,096 held-out robots per
+severity, with mid-move changes on:
+
+| Controller | Healthy | Severity 0.25 | 0.5 | 1 (worst) |
+| --- | --- | --- | --- | --- |
+| Servos sent the IK angles | 18.3% (12.9 mm) | 10.3% | 5.6% | 3.2% (29.5 mm) |
+| **Network, servos** | **91.9%** (1.7 mm) | **76.9%** | **68.6%** | **37.1%** (4.4 mm) |
+| Network, servos, targets held 1.2 s after each goal | 94.1% | 79.3% | 71.4% | 39.1% |
+| Torque: tuned PID | 40.9% | 12.4% | 8.4% | 3.3% |
+| Torque: computed torque, perfect knowledge | 91.7% | 45.5% | 9.7% | 1.4% |
+| Torque: network (best torque run) | 82.4% | 46.5% | 13.2% | 0.6% |
+
+Success needs the tool within 5 mm and 30 mrad and every joint at rest. On the worst arms, loosening
+the tolerance to 20 mm (and 120 mrad) only raises the network to 52%. What remains there is mostly
+joints that do not come to rest: with the targets held perfectly steady, two thirds of those arms
+still have a hunting servo at the end.
+
+### What did not work, and what did
+
+| Result | Tried | Lesson |
+| --- | --- | --- |
+| Failed | Learning inverse kinematics inside the network | Stalled at 15 mm on healthy arms. The closed-form hint fixed it. |
+| Failed | PPO fine-tuning at a fixed learning rate of 1e-4 | Wrecked a precise policy: one Adam step already moved it past a KL of 0.01. |
+| Worked | A critic warm-up, lower starting noise and a KL-adaptive step size | Fixed it. |
+| Failed | Training only on the most worn robots | Made the policy timid everywhere. |
+| Worked | Mixed severity | Fixed it. |
+| Failed | Torque control on worn arms | Even with perfect model knowledge. |
+| Worked | Position servos | 12× the success on the worst arms. |
+| No gain | An L1 penalty on target changes | |
+| Worse | Target hysteresis | |
+| No gain | Loosening the reward tolerance to the success bar | |
+| Slower | A wider network (384) with an insight head | Learned more slowly than 256 without. |
