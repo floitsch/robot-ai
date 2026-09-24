@@ -96,6 +96,7 @@ class ChainEnv:
                  episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
                  still_weight: float = 1.0, roughness_weight: float = 4.0) -> None:
         self.worlds, self.limbs, self.n = worlds, limbs, limbs * JOINTS_PER_LIMB
+        self.limb_joints = JOINTS_PER_LIMB
         self.device, self.severity, self.episode_ticks, self.changes = device, severity, episode_ticks, changes
         # A chain has a fast bending mode that a 100 Hz controller can excite; position error alone barely sees the
         # resulting 0.01 rad chatter, so the reward also asks for rest directly.
@@ -209,9 +210,34 @@ class ChainEnv:
             self._window_speed = torch.maximum(self._window_speed, speed)
         return self._observe(), reward
 
+    def _current(self, before: np.ndarray, after: np.ndarray, device: torch.device) -> dict[str, Tensor]:
+        """Every field of a structured parameter array as a tensor, after the mid-episode change where it happened."""
+
+        changed = torch.as_tensor(self.tick >= self.change_tick, device=device)
+        result = {}
+        for name in before.dtype.names or ():
+            a = torch.as_tensor(np.ascontiguousarray(before[name]), dtype=torch.float32, device=device)
+            b = torch.as_tensor(np.ascontiguousarray(after[name]), dtype=torch.float32, device=device)
+            result[name] = torch.where(changed.reshape(-1, *([1] * (a.dim() - 1))), b, a)
+        return result
+
+    def true_dynamics(self, q: Tensor, dq: Tensor) -> tuple[Tensor, Tensor]:
+        """Mass matrix and bias torques of the robots as they really are now; for teachers, never for policies."""
+
+        from ..control.computed_torque import chain_dynamics
+
+        links = self._current(self.links, self.changed[0], q.device)
+        return chain_dynamics(q, dq, links["length"], links["mass"], links["com"], links["inertia"])
+
+    def true_actuation(self, device: torch.device) -> tuple[Tensor, Tensor]:
+        """True torque per unit command and viscous damping per joint, now."""
+
+        joints = self._current(self.joints, self.changed[1], device)
+        return joints["torque_scale"], joints["damping"]
+
     def summary(self) -> ChainSummary:
         ok = (self._window_error < TOLERANCE) & (self._window_speed < SETTLED_SPEED)  # [worlds, n]
-        limb_ok = ok.reshape(self.worlds, self.limbs, JOINTS_PER_LIMB).all(dim=2)
+        limb_ok = ok.reshape(self.worlds, self.limbs, self.limb_joints).all(dim=2)
         ticks = float(self.tick)
         return ChainSummary(ok.all(dim=1), limb_ok, self._window_error.amax(dim=1), self._sum_error / ticks,
                             self._sum_rough / ticks, self._return)

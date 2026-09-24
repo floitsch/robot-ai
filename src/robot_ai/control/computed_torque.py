@@ -94,17 +94,6 @@ class ComputedTorqueTeacher(nn.Module):
         state[:, :self.n] = torch.nan
         return state
 
-    def _params(self, device: torch.device) -> tuple[Tensor, ...]:
-        env = self.env
-        changed = torch.as_tensor(env.tick >= env.change_tick, device=device)[:, None]
-        pick = lambda before, after: torch.where(changed, torch.as_tensor(after, dtype=torch.float32, device=device),
-                                                 torch.as_tensor(before, dtype=torch.float32, device=device))
-        links, joints = env.links, env.joints
-        clinks, cjoints = env.changed
-        return (pick(links["length"], clinks["length"]), pick(links["mass"], clinks["mass"]), pick(links["com"], clinks["com"]),
-                pick(links["inertia"], clinks["inertia"]), pick(joints["torque_scale"], cjoints["torque_scale"]),
-                pick(joints["damping"], cjoints["damping"]))
-
     def _friction_bound(self, q: Tensor, dq: Tensor, device: torch.device) -> Tensor:
         env = self.env
         changed = torch.as_tensor(env.tick >= env.change_tick, device=device)[:, None]
@@ -118,7 +107,7 @@ class ComputedTorqueTeacher(nn.Module):
     def forward(self, observations: Tensor, feeling: Tensor) -> tuple[Tensor, Tensor]:
         env, n = self.env, self.n
         device = feeling.device
-        goal = env.goal()
+        goal = env.joint_goal() if hasattr(env, "joint_goal") else env.goal()  # tool-pose tasks: the rigid arm's IK
         q_true, dq_true = env._truth[:, :n], env._truth[:, n:]
         bias = env._bias
         q = q_true + bias  # the controller reasons in encoder units, where the goal is given
@@ -137,8 +126,8 @@ class ComputedTorqueTeacher(nn.Module):
         if not self.ramp:
             ref, ref_v, ref_a = goal, torch.zeros_like(goal), torch.zeros_like(goal)
         desired = ref_a + self.kp * (ref - fb_q) + self.kd * (ref_v - fb_dq)
-        length, mass, com, inertia, torque_scale, damping = self._params(device)
-        m, dyn_bias = chain_dynamics(q_true, dq_true, length, mass, com, inertia)
+        torque_scale, damping = env.true_actuation(device)
+        m, dyn_bias = env.true_dynamics(q_true, dq_true)
         torque = torch.einsum("wij,wj->wi", m, desired) + dyn_bias + damping * dq_true
         if self.friction:
             intent = torch.where(fb_dq.abs() > 0.05, fb_dq, (ref - fb_q) * 2.0)

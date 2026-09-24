@@ -22,6 +22,7 @@ from pathlib import Path
 import torch
 from torch import Tensor, nn
 
+from ..sim.arm3d_env import Arm3DSummary
 from ..sim.chain_env import ChainEnv, ChainSummary
 from ..sim.population import NOMINAL_LENGTHS, NOMINAL_MASSES, NOMINAL_TORQUES
 from ..sim.reach_env import PRIVILEGED_DIM, EpisodeSummary, ReachEnv
@@ -31,6 +32,7 @@ EVAL_SEED = 987_654_321
 # actors also see it magnified and saturated at these scales, rad.
 FINE_ERROR_SCALES = (0.05, 0.5)
 ORACLE_FULL, ORACLE_CONDITION = 1, 2
+ARM3D_TASK = 3  # the 3D arm's task code (`arm3d_env.TASK_CODE`), saved in an Actor's layout
 # Per joint: the observation holds 6 blocks (q, dq, current, goal, error, previous command); the privileged
 # part starts with true q and dq. The single arm has 2 joints; chains have more.
 OBSERVATION_BLOCKS = 6
@@ -86,18 +88,21 @@ class Actor(nn.Module):
     history: Tensor
     joints: Tensor
     privileged_dim: Tensor
+    layout: Tensor
 
     def __init__(self, *, recurrent: bool, incremental: bool = False, fine_scales: Sequence[float] = (), hidden: int = 64,
                  oracle: int = 0, insight: bool = False, history: int = 0, joints: int = 2,
                  privileged_dim: int = PRIVILEGED_DIM, initial_std: Sequence[float] | None = None,
-                 extra_inputs: int = 0, message: int = 0) -> None:
+                 extra_inputs: int = 0, message: int = 0, layout: Sequence[int] | None = None) -> None:
         super().__init__()
         self.recurrent, self.hidden = recurrent, hidden
-        # The joint count fixes every input layout; the privileged width depends on the task's hidden fields.
+        # The joint count fixes the joint-goal tasks' input layout; the privileged width depends on the task's hidden
+        # fields. Other tasks give their own layout: task code, observation width, start and width of the goal error.
         self.register_buffer("joints", torch.tensor(joints))
         self.register_buffer("privileged_dim", torch.tensor(privileged_dim))
+        self.register_buffer("layout", torch.tensor(list(layout or (0, OBSERVATION_BLOCKS * joints, 4 * joints, joints))))
         self.n = joints
-        self.observation_dim = OBSERVATION_BLOCKS * joints
+        self.task, self.observation_dim, self.error_start, self.error_width = (int(v) for v in self.layout)
         self.sensor_dim = SENSOR_BLOCKS * joints
         # The last `history` raw sensor readings ride along in the recurrent state, so delayed and noisy
         # encoders can be read as a short window rather than one sample at a time.
@@ -109,7 +114,7 @@ class Actor(nn.Module):
         self.register_buffer("oracle", torch.tensor(int(oracle)))
         # Saved with the weights: the scales are part of what the encoder was trained to read.
         self.register_buffer("fine_scales", torch.tensor(list(fine_scales), dtype=torch.float32))
-        inputs = (privileged_dim if oracle else self.observation_dim) + joints * len(fine_scales) + self.sensor_dim * history
+        inputs = (privileged_dim if oracle else self.observation_dim) + self.error_width * len(fine_scales) + self.sensor_dim * history
         inputs += extra_inputs  # e.g. messages from other limbs, appended by the caller after the observation
         self.extra_inputs = extra_inputs
         # A message for other limbs, computed from the same features that drive the motors.
@@ -153,7 +158,7 @@ class Actor(nn.Module):
             observations = observations.clone()
             observations[..., self.observation_dim:self.observation_dim + 2 * self.n] = 0.0
         if len(self.fine_scales):
-            error = observations[..., 4 * self.n:5 * self.n]
+            error = observations[..., self.error_start:self.error_start + self.error_width]
             observations = torch.cat((observations, *(torch.tanh(error / scale) for scale in self.fine_scales)), dim=-1)
         hidden, window = feeling[:, :self.hidden], feeling[:, self.hidden:]
         if int(self.history):
@@ -202,10 +207,12 @@ def load_actor(run: Path, device: torch.device) -> Actor:
     state.setdefault("history", torch.tensor(0))
     state.setdefault("joints", torch.tensor(2))
     state.setdefault("privileged_dim", torch.tensor(PRIVILEGED_DIM))
+    joints = int(state["joints"])
+    state.setdefault("layout", torch.tensor([0, OBSERVATION_BLOCKS * joints, 4 * joints, joints]))
     actor = Actor(recurrent="core.weight_ih_l0" in state, incremental=bool(state["incremental"]),
                   fine_scales=state["fine_scales"].tolist(), hidden=state["head.weight"].shape[1],
                   oracle=int(state["oracle"]), insight="insight.weight" in state, history=int(state["history"]),
-                  joints=int(state["joints"]), privileged_dim=int(state["privileged_dim"])).to(device)
+                  joints=joints, privileged_dim=int(state["privileged_dim"]), layout=state["layout"].tolist()).to(device)
     actor.load_state_dict(state)
     return actor.eval()
 
@@ -215,9 +222,10 @@ def widen_to_oracle(student: Actor, privileged_dim: int, initial_std: Sequence[f
 
     oracle = Actor(recurrent=student.recurrent, incremental=bool(student.incremental), fine_scales=student.fine_scales.tolist(),
                    hidden=student.hidden, oracle=ORACLE_FULL, insight=student.insight is not None, history=int(student.history),
-                   joints=student.n, privileged_dim=privileged_dim, initial_std=initial_std).to(student.head.weight.device)
+                   joints=student.n, privileged_dim=privileged_dim, initial_std=initial_std,
+                   layout=student.layout.tolist()).to(student.head.weight.device)
     state = {k: v for k, v in student.state_dict().items()
-             if not k.startswith("encoder.0.weight") and k not in ("oracle", "privileged_dim")}
+             if not k.startswith("encoder.0.weight") and k not in ("oracle", "privileged_dim", "layout")}
     oracle.load_state_dict(state, strict=False)
     old, new = student.encoder[0].weight, oracle.encoder[0].weight
     assert isinstance(old, Tensor) and isinstance(new, Tensor)
@@ -233,16 +241,28 @@ def env_privileged_dim(env: object) -> int:
     return int(getattr(env, "privileged_dim", PRIVILEGED_DIM))
 
 
+def env_layout(env: object) -> list[int] | None:
+    """The Actor's input layout for tasks whose goals are not per joint."""
+
+    if not hasattr(env, "error_slice"):
+        return None
+    start, width = env.error_slice  # type: ignore[attr-defined]
+    return [int(env.task_code), int(env.observation_dim), start, width]  # type: ignore[attr-defined]
+
+
 def make_critic(privileged_dim: int = PRIVILEGED_DIM) -> nn.Module:
     return nn.Sequential(nn.Linear(privileged_dim, 128), nn.Tanh(), nn.Linear(128, 128), nn.Tanh(), nn.Linear(128, 1))
 
 
-def _metrics(summary: EpisodeSummary | ChainSummary) -> dict[str, float]:
+def _metrics(summary: EpisodeSummary | ChainSummary | Arm3DSummary) -> dict[str, float]:
     result = {"success": summary.success.float().mean().item(), "final_error_mrad": 1000 * summary.final_error.median().item(),
               "mean_error_rad": summary.mean_error.mean().item(), "roughness": summary.roughness.mean().item(),
               "return": summary.episode_return.mean().item()}
     if isinstance(summary, EpisodeSummary):
         result["limit_time"] = summary.limit_time.mean().item()
+    elif isinstance(summary, Arm3DSummary):
+        result["position_mm"] = 1000 * summary.position_error.median().item()
+        result["direction_mrad"] = 1000 * summary.direction_error.median().item()
     else:
         for limb, value in enumerate(summary.limb_success.float().mean(dim=0).tolist()):
             result[f"limb{limb}_success"] = value
@@ -251,10 +271,13 @@ def _metrics(summary: EpisodeSummary | ChainSummary) -> dict[str, float]:
 
 @torch.no_grad()
 def evaluate(controller: PidController | Actor, *, worlds: int, device: str, severity: float = 1.0,
-             changes: bool = True, pushes: bool = False, seed: int = EVAL_SEED, limbs: int = 0) -> dict[str, float]:
-    if limbs == 0 and isinstance(controller, nn.Module) and controller.n != 2:
+             changes: bool = True, pushes: bool = False, seed: int = EVAL_SEED, limbs: int = 0, robot: str = "") -> dict[str, float]:
+    if not robot and isinstance(controller, nn.Module) and getattr(controller, "task", 0) == ARM3D_TASK:
+        robot = "arm3d"
+    if limbs == 0 and not robot and isinstance(controller, nn.Module) and controller.n != 2:
         limbs = controller.n // 2
-    env = make_env(worlds, device=device, seed=seed, limbs=limbs, severity=severity, changes=changes, pushes=pushes)
+    env = make_env(worlds, device=device, seed=seed, limbs=limbs, robot=robot, severity=severity, changes=changes,
+                   pushes=pushes)
     observation = env.reset()
     feeling = controller.initial(worlds, env.torch_device) if isinstance(controller, nn.Module) else None
     for _ in range(env.episode_ticks):
@@ -281,11 +304,15 @@ def tune_pid(*, worlds: int, device: str) -> tuple[tuple[float, ...], dict[str, 
     return best[1], best[2]
 
 
-def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, **settings: object) -> ReachEnv:
-    """The single arm, or a stacked chain of `limbs` two-joint limbs when `limbs` is given."""
+def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, robot: str = "", **settings: object) -> ReachEnv:
+    """The planar arm, a stacked chain of `limbs` two-joint limbs when `limbs` is given, or the 3D arm."""
 
+    allowed = {"severity", "changes", "reward_tolerance", "still_weight", "roughness_weight"}
+    if robot == "arm3d":
+        from ..sim.arm3d_env import Arm3DEnv
+
+        return Arm3DEnv(worlds, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
     if limbs:
-        allowed = {"severity", "changes", "reward_tolerance", "still_weight", "roughness_weight"}
         return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
     return ReachEnv(worlds, device=device, seed=seed, **settings)  # type: ignore[arg-type]
 
@@ -295,13 +322,13 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
           friction_probability: float = 0.7, oracle: int = 0, insight_weight: float = 0.0, mixed: bool = False,
           reward_tolerance: float = 0.03, pushes: bool = False, limbs: int = 0, roughness_weight: float | None = None,
           per_limb: bool = False, message: int = 0, severity: float = 1.0, initial: Path | None = None,
-          severity_ramp: int = 0, peek: bool = False, identity: bool = False,
+          severity_ramp: int = 0, peek: bool = False, identity: bool = False, robot: str = "",
           chunk: int = 50, minibatch: int = 512, epochs: int = 4, gamma: float = 0.99, lam: float = 0.95,
           clip: float = 0.2, entropy: float = 0.002, learning_rate: float = 3e-4, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     torch.manual_seed(seed)
     # Only explicitly set weights are passed on, so each task keeps its own defaults.
     weights = {k: v for k, v in (("still_weight", still_weight or None), ("roughness_weight", roughness_weight)) if v is not None}
-    env = make_env(worlds, device=device, seed=seed, limbs=limbs, friction_probability=friction_probability, mixed=mixed,
+    env = make_env(worlds, device=device, seed=seed, limbs=limbs, robot=robot, friction_probability=friction_probability, mixed=mixed,
                    reward_tolerance=reward_tolerance, pushes=pushes, severity=severity, **weights)
     dev = env.torch_device
     actor: Actor
@@ -330,7 +357,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
     else:
         actor = Actor(recurrent=recurrent, incremental=incremental, fine_scales=fine_scales, hidden=hidden, oracle=oracle,
                       insight=insight_weight > 0, joints=getattr(env, "n", 2), privileged_dim=env_privileged_dim(env),
-                      initial_std=getattr(env, "initial_std", None)).to(dev)
+                      initial_std=getattr(env, "initial_std", None), layout=env_layout(env)).to(dev)
     critic = make_critic(env_privileged_dim(env)).to(dev)
     optimizer = torch.optim.Adam([*actor.parameters(), *critic.parameters()], lr=learning_rate)
     ticks = env.episode_ticks
@@ -413,7 +440,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         if actor.insight is not None:
             record["insight_loss"] = insight_loss.item()
         if iteration % eval_every == 0 or iteration == iterations:
-            record["eval"] = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs, severity=severity)
+            record["eval"] = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs, robot=robot, severity=severity)
             torch.save(actor.state_dict(), output / "actor.pt")
         log.write(json.dumps(record) + "\n")
         log.flush()
@@ -424,7 +451,8 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
             initial: Path | None = None, fine_scales: Sequence[float] = FINE_ERROR_SCALES, hidden: int = 64,
             insight_weight: float = 1.0, noise: float = 0.05, mixed: bool = False, pushes: bool = False, history: int = 0,
             limbs: int = 0, per_limb: bool = False, message: int = 0, severity: float = 1.0, teacher_drive: float = 0.0,
-            teacher_omega: float = 15.0, teacher_memoryless: bool = False, peek: bool = False, identity: bool = False, chunk: int = 50, minibatch: int = 512, epochs: int = 2,
+            teacher_omega: float = 15.0, teacher_memoryless: bool = False, peek: bool = False, identity: bool = False,
+            robot: str = "", chunk: int = 50, minibatch: int = 512, epochs: int = 2,
             learning_rate: float = 1e-3, eval_every: int = 10, eval_worlds: int = 4096) -> None:
     """Teach a deployable recurrent actor to act like an oracle, using only what a real robot can sense.
 
@@ -433,7 +461,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
     """
 
     torch.manual_seed(seed)
-    env = make_env(worlds, device=device, seed=seed, limbs=limbs, mixed=mixed, pushes=pushes, severity=severity)
+    env = make_env(worlds, device=device, seed=seed, limbs=limbs, robot=robot, mixed=mixed, pushes=pushes, severity=severity)
     dev = env.torch_device
     if str(teacher) == "computed-torque":
         # Classical teacher with perfect knowledge, reading the environment's truth directly.
@@ -458,7 +486,7 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
                              identity=identity).to(dev)  # type: ignore[assignment]
     else:
         student = Actor(recurrent=True, fine_scales=fine_scales, hidden=hidden, insight=insight_weight > 0, history=history,
-                        joints=oracle.n, privileged_dim=int(oracle.privileged_dim)).to(dev)
+                        joints=oracle.n, privileged_dim=env_privileged_dim(env), layout=env_layout(env)).to(dev)
     optimizer = torch.optim.Adam(student.parameters(), lr=learning_rate)
     ticks = env.episode_ticks
     chunks = ticks // chunk
@@ -514,7 +542,8 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
                                      "robot_ticks": iteration * worlds * ticks, "std": noise,
                                      "imitation_loss": imitation.item(), "rollout": rollout}
         if iteration % eval_every == 0 or iteration == iterations:
-            record["eval"] = evaluate(student.eval(), worlds=eval_worlds, device=device, limbs=limbs, severity=severity)
+            record["eval"] = evaluate(student.eval(), worlds=eval_worlds, device=device, limbs=limbs, robot=robot,
+                                      severity=severity)
             student.train()
             torch.save(student.state_dict(), output / "actor.pt")
         log.write(json.dumps(record) + "\n")
@@ -556,6 +585,7 @@ def main() -> None:
     fit.add_argument("--fine-error", type=float, nargs="*", default=None, metavar="RAD",
                      help="also feed the goal error magnified and saturated at these scales (default scales if none given)")
     fit.add_argument("--hidden", type=int, default=64)
+    fit.add_argument("--learning-rate", type=float, default=3e-4, help="initial PPO step size; lower it to continue a run")
     fit.add_argument("--limbs", type=int, default=0, help="train on a stacked chain of this many two-joint limbs")
     fit.add_argument("--severity", type=float, default=1.0, help="0 = healthy robots, 1 = the full defect population")
     fit.add_argument("--initial", type=Path, help="warm-start from this run (curriculum)")
@@ -598,6 +628,8 @@ def main() -> None:
         sub.add_argument("--identity", action="store_true", help="each limb is told its slot in the chain (per-limb only)")
 
     for sub in (fit, teach):
+        sub.add_argument("--robot", choices=("planar", "arm3d"), default="planar",
+                         help="arm3d: five-joint 3D arms with tool-pose goals")
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")
         sub.add_argument("--pushes", action="store_true", help="train with neighbour pushes at full severity")
     compare = commands.add_parser("report")
@@ -614,7 +646,8 @@ def main() -> None:
               insight_weight=args.insight_weight, mixed=args.mixed, reward_tolerance=args.reward_tolerance,
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
               severity=args.severity, initial=args.initial, minibatch=args.minibatch, severity_ramp=args.severity_ramp,
-              peek=args.peek, identity=args.identity,
+              learning_rate=args.learning_rate,
+              peek=args.peek, identity=args.identity, robot="" if args.robot == "planar" else args.robot,
               output=args.output, device=args.device, worlds=args.worlds,
               iterations=args.iterations, seed=args.seed)
     elif args.command == "distill":
@@ -622,7 +655,8 @@ def main() -> None:
                 iterations=args.iterations, hidden=args.hidden, seed=args.seed, mixed=args.mixed, pushes=args.pushes,
                 history=args.history, limbs=args.limbs, per_limb=args.per_limb, message=args.message, severity=args.severity,
                 minibatch=args.minibatch, teacher_drive=args.teacher_drive, teacher_omega=args.teacher_omega,
-                teacher_memoryless=args.teacher_memoryless, peek=args.peek, identity=args.identity)
+                teacher_memoryless=args.teacher_memoryless, peek=args.peek, identity=args.identity,
+                robot="" if args.robot == "planar" else args.robot)
     else:
         actors = {name: Path(path) for name, path in (item.split("=", 1) for item in args.actor)}
         print(json.dumps(report(actors, device=args.device, worlds=args.worlds, output=args.output), indent=2))

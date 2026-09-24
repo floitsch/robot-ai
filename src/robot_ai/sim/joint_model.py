@@ -24,6 +24,7 @@ class JointParams:
     torque_scale: float  # N m delivered at |command| = 1, including lost effectiveness
     motor_alpha: float  # first-order torque response per physics step, 1 = instant
     delay_steps: int  # command latency in physics steps
+    no_load_speed: float  # output speed at which back-EMF leaves no driving torque, rad/s; 0 = unlimited
     # Friction at the output joint.
     damping: float  # viscous, N m s/rad
     coulomb: float  # kinetic dry friction, N m
@@ -82,6 +83,15 @@ def drive_joint(p: JointParams, s: JointState, command: float, dt: float) -> Joi
 
     target = wp.clamp(command, -1.0, 1.0) * p.torque_scale
     s.motor_torque = s.motor_torque + p.motor_alpha * (target - s.motor_torque)
+    if p.no_load_speed > 0.0:
+        # Torque-speed curve: the faster the motor turns, the less torque it can add in that direction; braking is
+        # always available.
+        speed = s.dq
+        if p.half_gap > 0.0:
+            speed = s.dqm
+        if s.motor_torque * speed > 0.0:
+            available = p.torque_scale * wp.max(0.0, 1.0 - wp.abs(speed) / p.no_load_speed)
+            s.motor_torque = wp.clamp(s.motor_torque, -available, available)
     if p.half_gap <= 0.0:
         s.tau_out = s.motor_torque
         s.qm = s.q
