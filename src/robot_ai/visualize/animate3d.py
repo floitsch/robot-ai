@@ -28,27 +28,34 @@ SERVO_LABELS = {"classical": "Servos sent the IK angles", "network": "Our networ
 class IkTargets(torch.nn.Module):
     """Servo arms without a network: every joint's target is the inverse-kinematics solution, as LeRobot users send."""
 
+    def __init__(self, actions: int = 5) -> None:
+        super().__init__()
+        self.actions = actions
+
     def initial(self, worlds: int, device: torch.device) -> torch.Tensor:
         return torch.zeros((worlds, 1), device=device)
 
     def forward(self, observations: torch.Tensor, feeling: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.zeros((*observations.shape[:-1], 5), device=observations.device), feeling
+        return torch.zeros((*observations.shape[:-1], self.actions), device=observations.device), feeling
 AZIMUTH, ELEVATION = np.radians(-50.0), np.radians(22.0)
 
 
 @torch.no_grad()
-def record(controller: object, *, worlds: int, device: str, severity: float = 1.0,
-           servo: bool = False) -> tuple[Arm3DEnv, dict[str, np.ndarray]]:
-    """Per tick: joint origins and tool point [ticks, worlds, n + 1, 3], tool direction, goal pose, pose error."""
+def record(controller: object, *, worlds: int, device: str, severity: float = 1.0, servo: bool = False,
+           model: str = "desktop", contact: bool = False) -> tuple[Arm3DEnv, dict[str, np.ndarray]]:
+    """Per tick: joint origins and tool point [ticks, worlds, n + 1, 3], tool direction, goal pose, pose error, contact
+    force; and the obstacles."""
 
-    env = Arm3DEnv(worlds, device=device, seed=EVAL_SEED, severity=severity, servo=servo)
+    share = 0.5 if contact else 0.0
+    env = Arm3DEnv(worlds, device=device, seed=EVAL_SEED, severity=severity, servo=servo, model=model, accidents=share,
+                   touches=share)
     observation = env.reset()
     if callable(controller) and not isinstance(controller, torch.nn.Module):
         controller = controller(env)  # type: ignore[operator]
     assert isinstance(controller, torch.nn.Module)
     feeling = controller.initial(worlds, env.torch_device)  # type: ignore[operator]
     origin = wp.to_torch(env.batch.origin)  # type: ignore[attr-defined]  # an Arm3DBatch
-    frames: dict[str, list[np.ndarray]] = {"points": [], "direction": [], "goal": [], "error": []}
+    frames: dict[str, list[np.ndarray]] = {"points": [], "direction": [], "goal": [], "error": [], "force": []}
     for _ in range(env.episode_ticks):
         seen = env.privileged(observation) if int(getattr(controller, "oracle", 0)) and not hasattr(controller, "env") else observation
         mean, feeling = controller(seen[None], feeling)
@@ -59,7 +66,12 @@ def record(controller: object, *, worlds: int, device: str, severity: float = 1.
         pose_error = env._true_error()
         frames["error"].append(torch.stack((pose_error[:, :3].norm(dim=1) * POSITION_UNIT, pose_error[:, 3:6].norm(dim=1)),
                                            dim=1).cpu().numpy())
-    return env, {name: np.stack(values) for name, values in frames.items()}
+        frames["force"].append(env._contact[:, 1].cpu().numpy())
+    result = {name: np.stack(values) for name, values in frames.items()}
+    obstacles = env.batch.obstacles.numpy()  # type: ignore[attr-defined]
+    result["obstacles"] = obstacles
+    result["success"] = env.summary().success.cpu().numpy()
+    return env, result
 
 
 def pick_robots(env: Arm3DEnv) -> list[tuple[int, str]]:
@@ -85,8 +97,28 @@ def _project(points: np.ndarray, centre: tuple[float, float], scale: float) -> n
     return np.stack((centre[0] + scale * across, centre[1] - scale * up), axis=-1)
 
 
+def _obstacle(draw: ImageDraw.ImageDraw, centre: tuple[float, float], scale: float, obstacle: np.void) -> None:
+    from ..sim.arm3d_batch import BOX, CAPSULE
+
+    grey = (150, 110, 80)
+    if int(obstacle["kind"]) == BOX:
+        z, x = np.asarray(obstacle["b"]), np.asarray(obstacle["side"])
+        y = np.cross(z, x)
+        half = np.asarray(obstacle["half"])
+        corners = np.array([np.asarray(obstacle["a"]) + sx * half[0] * x + sy * half[1] * y + sz * half[2] * z
+                            for sx in (-1, 1) for sy in (-1, 1) for sz in (-1, 1)])
+        pixels = _project(corners, centre, scale)
+        for i in range(8):
+            for j in range(i + 1, 8):
+                if (i ^ j).bit_count() == 1:  # corners that differ along one axis share an edge
+                    draw.line((*pixels[i], *pixels[j]), fill=grey, width=2)
+    elif int(obstacle["kind"]) == CAPSULE:
+        ends = _project(np.stack((np.asarray(obstacle["a"]), np.asarray(obstacle["b"]))), centre, scale)
+        draw.line((*ends[0], *ends[1]), fill=grey, width=max(3, int(2 * scale * float(obstacle["radius"]))))
+
+
 def _panel(draw: ImageDraw.ImageDraw, centre: tuple[float, float], scale: float, points: np.ndarray, direction: np.ndarray,
-           goal: np.ndarray, color: tuple[int, int, int]) -> None:
+           goal: np.ndarray, color: tuple[int, int, int], obstacles: np.ndarray | None = None) -> None:
     grid = np.linspace(-0.4, 0.4, 5)
     for g in grid:
         for line in (np.array([[g, -0.4, 0.0], [g, 0.4, 0.0]]), np.array([[-0.4, g, 0.0], [0.4, g, 0.0]])):
@@ -97,6 +129,8 @@ def _panel(draw: ImageDraw.ImageDraw, centre: tuple[float, float], scale: float,
     arm = np.concatenate((np.zeros((1, 3)), points))
     flat = np.concatenate((np.zeros((1, 3)), shadow))
     draw.line([tuple(p) for p in _project(flat, centre, scale)], fill=(214, 214, 210), width=7, joint="curve")
+    for obstacle in () if obstacles is None else obstacles:
+        _obstacle(draw, centre, scale, obstacle)
     target = goal[:3]
     marker = _project(np.stack((target, target + 0.06 * goal[3:6], np.array([target[0], target[1], 0.0]))), centre, scale)
     draw.line((*marker[2], *marker[0]), fill=(205, 205, 205), width=1)
@@ -113,7 +147,7 @@ def _panel(draw: ImageDraw.ImageDraw, centre: tuple[float, float], scale: float,
 
 
 def render_gif(runs: dict[str, dict[str, np.ndarray]], picks: list[tuple[int, str]], output: Path, *, stride: int = 3,
-               panel: int = 220) -> None:
+               panel: int = 220, contact: bool = False) -> None:
     font, small = _font(14), _font(12)
     names = list(runs)
     label_width = 150
@@ -135,11 +169,17 @@ def render_gif(runs: dict[str, dict[str, np.ndarray]], picks: list[tuple[int, st
                 run = runs[name]
                 centre = (label_width + column * panel + panel / 2, top + panel * 0.8)
                 _panel(draw, centre, panel * 0.85, run["points"][tick, index], run["direction"][tick, index],
-                       run["goal"][tick, index], COLORS[name])
+                       run["goal"][tick, index], COLORS[name], run["obstacles"][index])
                 position, direction = run["error"][tick, index]
-                ok = position < TOLERANCE * POSITION_UNIT and direction < TOLERANCE
-                draw.text((label_width + column * panel + 8, top + panel + 2),
-                          f"{1000 * position:5.1f} mm {1000 * direction:4.0f} mrad {'✓' if ok else ''}",
+                force = float(run["force"][tick, index])
+                if contact:
+                    last = tick + stride >= ticks
+                    ok = bool(run["success"][index]) if last else force < 10.0
+                    text = f"contact {force:5.1f} N {'✓' if last and ok else ''}"
+                else:
+                    ok = position < TOLERANCE * POSITION_UNIT and direction < TOLERANCE
+                    text = f"{1000 * position:5.1f} mm {1000 * direction:4.0f} mrad {'✓' if ok else ''}"
+                draw.text((label_width + column * panel + 8, top + panel + 2), text,
                           fill=(20, 130, 60) if ok else (150, 40, 40), font=small)
         frames.append(image)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -164,17 +204,27 @@ def main() -> None:
         return ComputedTorqueTeacher(env, omega=15.0, measured=False, ramp=True).to(device)
 
     network = load_actor(args.run, device) if args.run else None
-    servo = network is not None and network.task == 4
+    task = -1 if network is None else int(network.task)
+    servo, model, contact = task in (4, 6, 14, 16), "so101" if task >= 14 else "desktop", task in (6, 16)
     if servo:
         LABELS.update(SERVO_LABELS)
-    baseline: object = IkTargets() if servo else classical
-    env, first = record(baseline, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo)
+    baseline: object = IkTargets(6 if contact else 5) if servo else classical
+    env, first = record(baseline, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo, model=model,
+                        contact=contact)
     runs = {"classical": first}
     if network is not None:
         driver: torch.nn.Module = SettleHold(network) if args.settle_hold and servo else network
-        runs["network"] = record(driver, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo)[1]
-    picks = pick_robots(env)
-    render_gif(runs, picks, args.gif)
+        runs["network"] = record(driver, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo,
+                                 model=model, contact=contact)[1]
+    if contact:
+        from ..sim.arm3d_env import ACCIDENT, TOUCH
+
+        modes = env.mode
+        picks = ([(int(i), "Something in the way") for i in np.flatnonzero(modes == ACCIDENT)[:3]]
+                 + [(int(i), "Find the surface") for i in np.flatnonzero(modes == TOUCH)[:3]])
+    else:
+        picks = pick_robots(env)
+    render_gif(runs, picks, args.gif, contact=contact)
     for index, title in picks:
         print(f"robot {index}: {title}; final error " + ", ".join(
             f"{name} {1000 * run['error'][-1, index, 0]:.1f} mm" for name, run in runs.items()))
