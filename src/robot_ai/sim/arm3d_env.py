@@ -23,7 +23,7 @@ import torch
 import warp as wp
 from torch import Tensor
 
-from .arm3d_batch import Arm3DBatch, Link3D
+from .arm3d_batch import CAPSULE, HALF_SPACE, MAX_OBSTACLES, Arm3DBatch, Link3D, Obstacle
 from .chain_env import ChainEnv, ChainSummary
 from .population import _per_world, sample_joint_defects
 from .reach_env import FINAL_WINDOW, SETTLED_SPEED, TOLERANCE
@@ -71,6 +71,7 @@ def _links(lengths: np.ndarray, masses: np.ndarray, side_offset: np.ndarray) -> 
     links["com"][:, -1, 0] = side_offset
     links["mass"] = masses
     links["inertia"] = _cylinder_inertia(masses, lengths, np.broadcast_to(RADII, lengths.shape))
+    links["radius"] = RADII
     tip = np.zeros((worlds, 3))
     tip[:, 2] = lengths[:, -1]
     return links, tip
@@ -155,6 +156,30 @@ def _rotation(axis: Tensor, angle: Tensor) -> Tensor:
     k = torch.stack((torch.stack((zero, -z, y), -1), torch.stack((z, zero, -x), -1), torch.stack((-y, x, zero), -1)), -2)
     s, c = torch.sin(angle)[:, None, None], torch.cos(angle)[:, None, None]
     return torch.eye(3, dtype=axis.dtype, device=axis.device) + s * k + (1.0 - c) * (k @ k)
+
+
+def arm3d_points(q: Tensor, joint_pos: Tensor, axis: Tensor, tip: Tensor) -> Tensor:
+    """[W, n + 1, 3]: every joint's position and then the tool point, of rigid arms."""
+
+    worlds, n = q.shape
+    rot = torch.eye(3, dtype=q.dtype, device=q.device).expand(worlds, 3, 3)
+    pos = torch.zeros((worlds, 3), dtype=q.dtype, device=q.device)
+    points = []
+    for k in range(n):
+        pos = pos + (rot @ joint_pos[:, k, :, None])[..., 0]
+        points.append(pos)
+        rot = rot @ _rotation(axis[:, k], q[:, k])
+    points.append(pos + (rot @ tip[..., None])[..., 0])
+    return torch.stack(points, dim=1)
+
+
+def _segment_distance(p0: Tensor, p1: Tensor, q0: Tensor, q1: Tensor) -> Tensor:
+    """Distances [...] between segments p0-p1 and q0-q1 (all [..., 3]), by dense sampling: for placement checks only."""
+
+    s = torch.linspace(0.0, 1.0, 17, dtype=p0.dtype, device=p0.device)
+    a = p0[..., None, :] + (p1 - p0)[..., None, :] * s[:, None]
+    b = q0[..., None, :] + (q1 - q0)[..., None, :] * s[:, None]
+    return (a[..., :, None, :] - b[..., None, :, :]).norm(dim=-1).amin(dim=(-1, -2))
 
 
 def arm3d_tool(q: Tensor, joint_pos: Tensor, axis: Tensor, tip: Tensor) -> tuple[Tensor, Tensor]:
@@ -253,10 +278,37 @@ def arm3d_dynamics(q: Tensor, dq: Tensor, joint_pos: Tensor, axis: Tensor, com: 
     return m, torch.stack(bias[::-1], dim=1)
 
 
+REACH, ACCIDENT, TOUCH = 0, 1, 2
+RETREAT = 0.05  # rad: how far the brake can pull the targets back past where the arm is
+
+
+def braked(targets: Tensor, measured: Tensor, action: Tensor) -> Tensor:
+    """The brake action in [-1, 1] as b = 1.5 * action, from 0 (off, and for negative actions) to 1.5.
+
+    Up to 1 it pulls every target from the goal side towards where the arm is now: 1 stops the arm where it stands.
+    Beyond 1 it backs off: the targets move past the arm, away from the goal, by up to RETREAT on the joint furthest
+    from its target.
+    """
+
+    b = (1.5 * action).clamp(0.0, 1.5)[:, None]
+    blended = targets + b.clamp(max=1.0) * (measured - targets)
+    away = measured - targets
+    back = away / away.abs().amax(dim=1, keepdim=True).clamp(min=1e-6)
+    return blended + (b - 1.0).clamp(min=0.0) / 0.5 * RETREAT * back
+TOUCH_BAND = (0.5, 10.0)  # N: touching the surface, not pressing into it
+TOUCH_PEAK = 20.0  # N: the touch must not come in hard
+RELEASE_TIME = 0.3  # s: after an accident, the contact must be released this soon
+RELEASED = 0.5  # N: below this, the arm has let go
+CONTACT_UNIT = 10.0  # N per unit in observations and rewards
+
+
 @dataclass
 class Arm3DSummary(ChainSummary):
     position_error: Tensor  # [worlds] worst tool position error over the final window, m
     direction_error: Tensor  # [worlds] worst tool direction error over the final window, rad
+    mode: Tensor | None = None  # [worlds] REACH, ACCIDENT or TOUCH
+    peak_force: Tensor | None = None  # [worlds] highest contact force of the episode, N
+    impulse: Tensor | None = None  # [worlds] contact force integrated over the episode, N s
 
 
 class Arm3DEnv(ChainEnv):
@@ -276,7 +328,7 @@ class Arm3DEnv(ChainEnv):
     def __init__(self, worlds: int, *, device: str = "cuda:0", seed: int = 0, severity: float = 1.0,
                  episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
                  still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False, servo: bool = False,
-                 hold_weight: float = 0.0, stiffness: bool = False) -> None:
+                 hold_weight: float = 0.0, stiffness: bool = False, accidents: float = 0.0, touches: float = 0.0) -> None:
         self.worlds, self.limbs, self.n, self.limb_joints = worlds, 1, JOINTS, JOINTS
         # Mixed: every robot gets its own severity, from flawless to `severity`, so training on worn arms does not
         # cost precision on good ones.
@@ -292,6 +344,15 @@ class Arm3DEnv(ChainEnv):
         # Hold: an L1 charge on every change of the commanded targets. Unlike the squared roughness charge it makes
         # exactly-still targets worth having: a servo follows even a 1 mrad jitter, and a worn one never settles.
         self.hold_weight = hold_weight
+        # Contact tasks (servo arms): in a share of episodes an unseen post stands in the tool's way (the controller must
+        # recognize the blow from its feel, stop and let go), and in another share it is told to find a surface along
+        # the tool's direction somewhere before the goal and to touch it gently.
+        self.accidents, self.touches = accidents, touches
+        self.contact_tasks = servo and (accidents > 0 or touches > 0)
+        # With contact tasks the policy also has a brake (see `braked`): stop where it stands, or back off.
+        if self.contact_tasks:
+            self.task_code = TASK_CODE + 3
+            self.action_dim = self.action_dim + 1
         self.device, self.severity, self.episode_ticks, self.changes = device, severity, episode_ticks, changes
         self.reward_tolerance, self.still_weight, self.roughness_weight = reward_tolerance, still_weight, roughness_weight
         self.rng = np.random.default_rng([seed, 3000 + JOINTS])
@@ -302,9 +363,11 @@ class Arm3DEnv(ChainEnv):
         self.nominal_torques = NOMINAL_TORQUES
         self._torque = torch.as_tensor(NOMINAL_TORQUES, dtype=torch.float32, device=self.torch_device)
         self.initial_std = [0.3 if servo else 0.5] * self.action_dim
-        self.observation_dim = 4 * self.n + 7 + self.n + 7 + self.n + 6 + self.n
+        if self.contact_tasks:
+            self.initial_std[-1] = 1.0  # the brake has to be tried hard enough to discover backing off
+        self.observation_dim = 4 * self.n + 7 + self.n + 7 + self.n + 6 + self.n + (1 if self.contact_tasks else 0)
         self.error_slice = (4 * self.n, 7 + self.n)
-        self.privileged_dim = self.observation_dim + 2 * self.n + 7 + 12 * self.n
+        self.privileged_dim = self.observation_dim + 2 * self.n + 7 + 12 * self.n + (5 if self.contact_tasks else 0)
 
     def _hidden(self, links: np.ndarray, joints: np.ndarray) -> Tensor:
         return self._tensor(np.concatenate((joints["torque_scale"] / NOMINAL_TORQUES, joints["coulomb"] * 4.0,
@@ -336,11 +399,14 @@ class Arm3DEnv(ChainEnv):
         ticks = self.episode_ticks
         change_tick = np.where(self.rng.random(self.worlds) < (0.5 if self.changes else 0.0),
                                self.rng.integers(20, ticks - 60, self.worlds), np.iinfo(np.int32).max)
-        self.batch = Arm3DBatch(links, joints, tip, device=self.device, seed=int(self.rng.integers(2**31)),
-                                changed=changed, change_tick=change_tick)
-        self.batch.reset(self._poses(links, tip))
+        start = self._poses(links, tip)
         joint_goals = np.stack((self._poses(links, tip), self._poses(links, tip)))
         regoal = np.where(self.rng.random(self.worlds) < 0.7, self.rng.integers(80, ticks - 120, self.worlds), ticks + 1)
+        obstacles, mode, surface = self._contact_tasks(links, tip, start, joint_goals[0])
+        regoal = np.where(mode == REACH, regoal, ticks + 1)  # contact tasks have one goal
+        self.batch = Arm3DBatch(links, joints, tip, device=self.device, seed=int(self.rng.integers(2**31)),
+                                changed=changed, change_tick=change_tick, obstacles=obstacles)
+        self.batch.reset(start)
         self.links, self.joints, self.changed, self.change_tick, self.regoal_tick = links, joints, changed, change_tick, regoal
         self._tensors: dict[int, tuple[np.ndarray, np.ndarray, dict[str, tuple[Tensor, Tensor]]]] = {}
         self.tip_offset = tip
@@ -352,6 +418,18 @@ class Arm3DEnv(ChainEnv):
         self._goals = self._tensor(joint_goals)
         self._pose_goals = torch.stack([torch.cat((*arm3d_tool(g, self._joint_pos, self._axis, self._tip_offset),
                                                    g[:, -1:]), dim=1) for g in self._goals])
+        # Touch: the goal the controller is told lies beyond the surface; it is judged on the surface point.
+        self.mode, self._mode = mode, self._tensor(mode).long()
+        self._surface = self._tensor(surface)
+        self._judged = self._pose_goals.clone()
+        touching = self._mode == TOUCH
+        self._judged[0, touching, :3] = self._surface[touching]
+        self._contact = wp.to_torch(self.batch.contact)
+        self._first_contact = torch.full((self.worlds,), float(ticks + 1), device=self.torch_device)
+        self._released = torch.zeros(self.worlds, dtype=torch.bool, device=self.torch_device)
+        self._window_force = torch.zeros((self.worlds, 2), device=self.torch_device)  # min and max over the window
+        self._window_force[:, 0] = torch.inf
+        self._impulse = torch.zeros(self.worlds, device=self.torch_device)
         self._regoal = self._tensor(regoal)
         self._solution = self._goals[0].clone()
         self._solution_phase = torch.ones(self.worlds, dtype=torch.bool, device=self.torch_device)  # none chosen yet
@@ -372,6 +450,69 @@ class Arm3DEnv(ChainEnv):
         self._window_error = torch.zeros((self.worlds, self.components), device=self.torch_device)
         self._window_speed = torch.zeros((self.worlds, self.n), device=self.torch_device)
         return self._observe()
+
+    def _contact_tasks(self, links: np.ndarray, tip: np.ndarray, start: np.ndarray,
+                       goal: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Obstacles [worlds, MAX_OBSTACLES], mode per world, and the touch surface point (m) per world."""
+
+        obstacles = np.zeros((self.worlds, MAX_OBSTACLES), dtype=Obstacle.numpy_dtype())
+        mode = np.full(self.worlds, REACH)
+        surface = np.zeros((self.worlds, 3))
+        if not self.contact_tasks:
+            return obstacles, mode, surface
+        draw = self.rng.random(self.worlds)
+        mode[draw < self.accidents + self.touches] = TOUCH
+        mode[draw < self.accidents] = ACCIDENT
+        obstacles["stiffness"] = self.rng.uniform(3e3, 3e4, (self.worlds, MAX_OBSTACLES))  # foam to wood
+        # Real contacts dissipate: without this a servo pushing into a stiff surface rings against it.
+        obstacles["damping"] = 0.6 * np.sqrt(obstacles["stiffness"])
+        obstacles["friction"] = self.rng.uniform(0.1, 0.6, (self.worlds, MAX_OBSTACLES))
+        t = torch.as_tensor
+        geometry = (t(links["joint_pos"]).double(), t(links["axis"]).double(), t(tip).double())
+        before, after = arm3d_points(t(start), *geometry), arm3d_points(t(goal), *geometry)
+        radius = t(links["radius"]).double()
+        point_radius = torch.cat((radius[:, 1:], radius[:, -1:]), dim=1)  # joints 1.. and the tool point, per link
+        # Touch: a wall across the tool's direction, 2-6 cm short of the goal; the arm starts clear of it.
+        direction = arm3d_tool(t(goal), *geometry)[1]
+        short = t(self.rng.uniform(0.02, 0.06, self.worlds))
+        point = after[:, -1] - direction * short[:, None]  # where the tool point rests when it touches
+        wall = point + direction * radius[:, -1:]  # the tool's capsule reaches one radius beyond its point
+        clear = ((before - wall[:, None]) * -direction[:, None]).sum(-1)[:, 1:] > point_radius + 0.01
+        touch = (mode == TOUCH) & clear.all(dim=1).numpy()
+        mode[(mode == TOUCH) & ~touch] = REACH
+        obstacles["kind"][touch, 0] = HALF_SPACE
+        obstacles["a"][touch, 0] = wall[touch].numpy()
+        obstacles["b"][touch, 0] = -direction[touch].numpy()
+        surface[touch] = point[touch].numpy()
+        # Accident: something in the tool's way, clear of the arm at the start and at the goal. Half the time a wall
+        # across the straight path (a box, a person), otherwise a thick post or limb.
+        along = t(self.rng.uniform(0.3, 0.7, self.worlds))
+        centre = before[:, -1] + (after[:, -1] - before[:, -1]) * along[:, None]
+        heading = torch.nn.functional.normalize(after[:, -1] - before[:, -1], dim=1)
+        tilt = t(self.rng.normal(0.0, 1.0, (self.worlds, 3)))
+        tilt[:, 2] = tilt[:, 2].abs() + 1.0  # mostly upright
+        tilt = tilt / tilt.norm(dim=1, keepdim=True)
+        half = t(self.rng.uniform(0.05, 0.15, self.worlds))[:, None]
+        a, b = centre - tilt * half, centre + tilt * half
+        size = t(self.rng.uniform(0.03, 0.06, self.worlds))
+        margin = (size + 0.01)[:, None] + radius[:, 1:]
+        apart = torch.stack([_segment_distance(pose[:, 1:-1], pose[:, 2:], a[:, None].expand(-1, self.n - 1, -1),
+                                               b[:, None].expand(-1, self.n - 1, -1)) for pose in (before, after)])
+        post_clear = (apart > margin).all(dim=(0, 2))
+        # A wall: its surface through the crossing point, facing back towards the start; the start pose must be in front.
+        facing = ((before[:, 1:] - centre[:, None]) * -heading[:, None]).sum(-1) > point_radius + 0.01
+        wall = t(self.rng.random(self.worlds) < 0.5)
+        travel = (after[:, -1] - before[:, -1]).norm(dim=1)
+        clear = torch.where(wall, facing.all(dim=1), post_clear)
+        accident = (mode == ACCIDENT) & clear.numpy() & (travel > 0.08).numpy()
+        mode[(mode == ACCIDENT) & ~accident] = REACH
+        walls, posts = accident & wall.numpy(), accident & ~wall.numpy()
+        obstacles["kind"][walls, 0] = HALF_SPACE
+        obstacles["a"][walls, 0], obstacles["b"][walls, 0] = centre[walls].numpy(), -heading[walls].numpy()
+        obstacles["kind"][posts, 0] = CAPSULE
+        obstacles["a"][posts, 0], obstacles["b"][posts, 0] = a[posts].numpy(), b[posts].numpy()
+        obstacles["radius"][posts, 0] = size[posts].numpy()
+        return obstacles, mode, surface
 
     def _later(self) -> Tensor:
         return (self.tick >= self._regoal)[:, None]
@@ -407,7 +548,12 @@ class Arm3DEnv(ChainEnv):
         return torch.cat(((goal[:, :3] - point) / POSITION_UNIT, goal[:, 3:6] - direction, goal[:, 6:] - roll[:, None]), dim=1)
 
     def _true_error(self) -> Tensor:
-        return self._pose_error(self._tip, self._tool_axis, self._truth[:, self.n - 1] + self._bias[:, -1])
+        """Pose error as judged: for a touch, towards the surface point rather than the goal the controller was told."""
+
+        judged = torch.where(self._later(), self._judged[1], self._judged[0])
+        roll = self._truth[:, self.n - 1] + self._bias[:, -1]
+        return torch.cat(((judged[:, :3] - self._tip) / POSITION_UNIT, judged[:, 3:6] - self._tool_axis,
+                          judged[:, 6:] - roll[:, None]), dim=1)
 
     def _observe(self) -> Tensor:
         raw, n = self._observation, self.n
@@ -417,13 +563,18 @@ class Arm3DEnv(ChainEnv):
         return torch.cat((self.measured_q / torch.pi, self.velocity / 5.0, raw[:, 2 * n:3 * n] / self._torque, self._previous,
                           self._pose_error(point, direction, self.measured_q[:, -1]), solution - self.measured_q,
                           goal[:, :3] / 0.5, goal[:, 3:6], goal[:, 6:] / torch.pi, solution / torch.pi,
-                          point / 0.5, direction, self._geometry), dim=1)
+                          point / 0.5, direction, self._geometry,
+                          *(((self._mode == TOUCH).float()[:, None],) if self.contact_tasks else ())), dim=1)
 
     def privileged(self, observation: Tensor) -> Tensor:
         n = self.n
         hidden = torch.where((self.tick >= self._change_tick)[:, None], self._hidden_after, self._hidden_before)
-        return torch.cat((observation, self._truth[:, :n] / torch.pi, self._truth[:, n:] / 5.0, self._true_error(), hidden),
-                         dim=1)
+        extra = ()
+        if self.contact_tasks:
+            extra = (self._contact[:, :1] / CONTACT_UNIT, self._contact[:, 2:3] / (2.0 * CONTACT_UNIT),
+                     torch.nn.functional.one_hot(self._mode, 3).float())
+        return torch.cat((observation, self._truth[:, :n] / torch.pi, self._truth[:, n:] / 5.0, self._true_error(), hidden,
+                          *extra), dim=1)
 
     def step(self, action: Tensor, reference: Tensor | None = None) -> tuple[Tensor, Tensor]:
         n = self.n
@@ -431,8 +582,11 @@ class Arm3DEnv(ChainEnv):
         smooth = action if reference is None else reference.clamp(-1.0, 1.0)
         if self.servo:
             limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device)
-            targets = torch.maximum(torch.minimum(self.joint_goal() + SERVO_REACH * action[:, :n], limits[:, 1]), limits[:, 0])
-            self.batch.step(targets, torch.exp2(action[:, n:]) if self.stiffness else None)
+            targets = self.joint_goal() + SERVO_REACH * action[:, :n]
+            if self.contact_tasks:
+                targets = braked(targets, self.measured_q, action[:, -1])
+            targets = torch.maximum(torch.minimum(targets, limits[:, 1]), limits[:, 0])
+            self.batch.step(targets, torch.exp2(action[:, n:2 * n]) if self.stiffness else None)
         else:
             self.batch.step(action)
         self.tick += 1
@@ -454,6 +608,8 @@ class Arm3DEnv(ChainEnv):
         if self.still_weight:
             reward = reward + 0.1 * self.still_weight * (close * torch.exp(-speed.amax(dim=1) / (2.0 * SETTLED_SPEED))
                                                          - 0.2 * speed.mean(dim=1))
+        if self.contact_tasks:
+            reward = self._contact_reward(reward, speed)
         self._previous = action[:, :n]
         self._sum_error += error.mean(dim=1)
         self._sum_rough += rough * scale
@@ -463,11 +619,44 @@ class Arm3DEnv(ChainEnv):
             self._window_speed = torch.maximum(self._window_speed, speed)
         return self._observe(), reward
 
+    def _contact_reward(self, reward: Tensor, speed: Tensor) -> Tensor:
+        """Accident: after the first blow, only letting go and keeping still count. Touch: come in softly, then rest
+        against the surface in the touch band. Also tracks what the summary judges."""
+
+        force, peak = self._contact[:, 0], self._contact[:, 1]
+        self._impulse += self._contact[:, 3]
+        touched = peak > RELEASED
+        self._first_contact = torch.where(touched & (self._first_contact > self.tick), float(self.tick), self._first_contact)
+        hit = (self._mode == ACCIDENT) & (self._first_contact <= self.tick)
+        in_time = self.tick <= self._first_contact + RELEASE_TIME / 0.01
+        self._released = self._released | (hit & ~touched & in_time)
+        after_blow = 0.1 * (-peak / CONTACT_UNIT - 0.5 * speed.mean(dim=1) + (~touched).float() * torch.exp(
+            -speed.amax(dim=1) / (2.0 * SETTLED_SPEED)))
+        reward = torch.where(hit, after_blow, reward)
+        touch = self._mode == TOUCH
+        low, high = TOUCH_BAND
+        band = ((force >= low) & (force <= high)).float()
+        soft = 0.1 * (band - torch.relu(force - high) / CONTACT_UNIT - torch.relu(peak - TOUCH_PEAK) / CONTACT_UNIT)
+        reward = torch.where(touch, reward + soft, reward)
+        if self.tick > self.episode_ticks - FINAL_WINDOW:
+            self._window_force[:, 0] = torch.minimum(self._window_force[:, 0], force)
+            self._window_force[:, 1] = torch.maximum(self._window_force[:, 1], force)
+        return reward
+
     def summary(self) -> Arm3DSummary:
-        ok = (self._window_error < TOLERANCE).all(dim=1) & (self._window_speed < SETTLED_SPEED).all(dim=1)
+        still = (self._window_speed < SETTLED_SPEED).all(dim=1)
+        ok = (self._window_error < TOLERANCE).all(dim=1) & still
+        if self.contact_tasks:
+            low, high = TOUCH_BAND
+            touched = ((self._window_error < TOLERANCE).all(dim=1) & still & (self._window_force[:, 0] >= low)
+                       & (self._window_force[:, 1] <= high) & (self._contact[:, 2] <= TOUCH_PEAK))
+            hit = self._first_contact <= self.tick
+            let_go = self._released & (self._window_force[:, 1] <= 2.0 * RELEASED) & still
+            ok = torch.where(self._mode == TOUCH, touched, torch.where((self._mode == ACCIDENT) & hit, let_go, ok))
         ticks = float(self.tick)
         return Arm3DSummary(ok, ok[:, None], self._window_error.amax(dim=1), self._sum_error / ticks, self._sum_rough / ticks,
-                            self._return, self._window_error[:, 0] * POSITION_UNIT, self._window_error[:, 1])
+                            self._return, self._window_error[:, 0] * POSITION_UNIT, self._window_error[:, 1],
+                            self._mode.clone(), self._contact[:, 2].clone(), self._impulse.clone())
 
     def true_dynamics(self, q: Tensor, dq: Tensor) -> tuple[Tensor, Tensor]:
         links = self._current(self.links, self.changed[0], q.device)

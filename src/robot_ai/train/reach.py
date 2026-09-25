@@ -33,7 +33,7 @@ EVAL_SEED = 987_654_321
 FINE_ERROR_SCALES = (0.05, 0.5)
 ORACLE_FULL, ORACLE_CONDITION = 1, 2
 # The 3D arm's task codes (`arm3d_env.TASK_CODE`, + 1 with position servos), saved in an Actor's layout.
-ROBOT_BY_TASK = {3: "arm3d", 4: "arm3d-servo", 5: "arm3d-servo-stiff"}
+ROBOT_BY_TASK = {3: "arm3d", 4: "arm3d-servo", 5: "arm3d-servo-stiff", 6: "arm3d-servo-contact"}
 # Per joint: the observation holds 6 blocks (q, dq, current, goal, error, previous command); the privileged
 # part starts with true q and dq. The single arm has 2 joints; chains have more.
 OBSERVATION_BLOCKS = 6
@@ -238,15 +238,25 @@ def widen_to_oracle(student: Actor, privileged_dim: int, initial_std: Sequence[f
     return oracle
 
 
-def widen_actions(actor: Actor, action_dim: int, layout: list[int] | None) -> Actor:
-    """The same policy with more outputs: new commands start at 0 (for servo stiffness: as tuned), with the old noise."""
+def widen_actions(actor: Actor, action_dim: int, layout: list[int] | None, privileged_dim: int | None = None) -> Actor:
+    """The same policy with more outputs and inputs appended to its observation: new commands start at 0 (servo
+    stiffness as tuned, the brake off) with the old noise, and new inputs start unread."""
 
     wider = Actor(recurrent=actor.recurrent, incremental=bool(actor.incremental), fine_scales=actor.fine_scales.tolist(),
                   hidden=actor.hidden, oracle=int(actor.oracle), insight=actor.insight is not None,
-                  history=int(actor.history), joints=action_dim, privileged_dim=int(actor.privileged_dim),
+                  history=int(actor.history), joints=action_dim,
+                  privileged_dim=int(actor.privileged_dim) if privileged_dim is None else privileged_dim,
                   layout=layout).to(actor.head.weight.device)
-    state = {k: v for k, v in actor.state_dict().items() if not k.startswith("head.") and k not in ("joints", "layout")}
+    skip = ("joints", "layout", "privileged_dim", "encoder.0.weight")
+    state = {k: v for k, v in actor.state_dict().items() if not k.startswith(("head.", "insight.")) and k not in skip}
     wider.load_state_dict(state, strict=False)
+    old, new = actor.encoder[0].weight, wider.encoder[0].weight
+    assert isinstance(old, Tensor) and isinstance(new, Tensor)
+    before, after = actor.observation_dim, wider.observation_dim
+    with torch.no_grad():
+        new.zero_()
+        new[:, :before] = old[:, :before]  # the observation block leads; appended inputs start unread
+        new[:, after:after + old.shape[1] - before] = old[:, before:]  # magnified errors and history follow it
     n = actor.n
     with torch.no_grad():
         wider.head.weight.zero_()
@@ -285,6 +295,14 @@ def _metrics(summary: EpisodeSummary | ChainSummary | Arm3DSummary) -> dict[str,
     elif isinstance(summary, Arm3DSummary):
         result["position_mm"] = 1000 * summary.position_error.median().item()
         result["direction_mrad"] = 1000 * summary.direction_error.median().item()
+        if summary.mode is not None and summary.peak_force is not None:
+            for code, name in enumerate(("reach", "accident", "touch")):
+                chosen = summary.mode == code
+                if chosen.any():
+                    result[f"{name}_success"] = summary.success[chosen].float().mean().item()
+                    result[f"{name}_peak_force"] = summary.peak_force[chosen].median().item()
+                    if summary.impulse is not None:
+                        result[f"{name}_impulse"] = summary.impulse[chosen].median().item()
     else:
         for limb, value in enumerate(summary.limb_success.float().mean(dim=0).tolist()):
             result[f"limb{limb}_success"] = value
@@ -333,7 +351,9 @@ def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, robot: str 
     if robot.startswith("arm3d"):
         from ..sim.arm3d_env import Arm3DEnv
 
+        contact = {"accidents": 0.25, "touches": 0.25} if robot == "arm3d-servo-contact" else {}
         return Arm3DEnv(worlds, device=device, seed=seed, servo=robot.startswith("arm3d-servo"), stiffness=robot == "arm3d-servo-stiff",
+                        **contact,  # type: ignore[arg-type]
                         **{k: v for k, v in settings.items() if k in allowed | {"mixed", "hold_weight"}})  # type: ignore[arg-type,return-value]
     if limbs:
         return ChainEnv(worlds, limbs, device=device, seed=seed, **{k: v for k, v in settings.items() if k in allowed})  # type: ignore[arg-type,return-value]
@@ -361,8 +381,10 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         # Curriculum: continue a policy trained under easier conditions, e.g. healthy robots before defective ones.
         actor = load_actor(initial, dev).train()
         action_dim = getattr(env, "action_dim", getattr(env, "n", 2))
-        if actor.n < action_dim and isinstance(actor, Actor) and actor.task + 1 == getattr(env, "task_code", 0):
-            actor = widen_actions(actor, action_dim, env_layout(env)).train()
+        observation_dim = getattr(env, "observation_dim", actor.observation_dim)
+        if isinstance(actor, Actor) and (actor.n < action_dim or actor.observation_dim < observation_dim):
+            # A task that extends an earlier one (more outputs, inputs appended): keep what the policy knows.
+            actor = widen_actions(actor, action_dim, env_layout(env), env_privileged_dim(env)).train()
         if actor.n != action_dim:
             raise ValueError("the initial policy was trained for a different joint count")
         if oracle and not int(actor.oracle):
@@ -706,7 +728,8 @@ def main() -> None:
         sub.add_argument("--identity", action="store_true", help="each limb is told its slot in the chain (per-limb only)")
 
     for sub in (fit, teach):
-        sub.add_argument("--robot", choices=("planar", "arm3d", "arm3d-servo", "arm3d-servo-stiff"), default="planar",
+        sub.add_argument("--robot", choices=("planar", "arm3d", "arm3d-servo", "arm3d-servo-stiff", "arm3d-servo-contact"),
+                         default="planar",
                          help="arm3d: five-joint 3D arms with tool-pose goals, driven by torque, by position servos, or by "
                               "position servos whose stiffness the network also sets")
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")

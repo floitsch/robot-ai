@@ -338,3 +338,80 @@ def test_a_stiffness_network_steps_with_twice_as_many_actions() -> None:
     for _ in range(5):
         observation, reward = env.step(torch.zeros(8, env.action_dim), reference=torch.zeros(8, env.action_dim))
     assert torch.isfinite(reward).all()
+
+
+def _obstacles(worlds: int, *items: dict) -> np.ndarray:
+    from robot_ai.sim.arm3d_batch import MAX_OBSTACLES, Obstacle
+
+    obstacles = np.zeros((worlds, MAX_OBSTACLES), dtype=Obstacle.numpy_dtype())
+    for k, item in enumerate(items):
+        for name, value in {"stiffness": 1e4, "damping": 30.0, "friction": 0.3, **item}.items():
+            obstacles[name][:, k] = value
+    return obstacles
+
+
+def test_an_arm_resting_on_a_table_is_held_up_by_the_contact_force() -> None:
+    from robot_ai.sim.arm3d_batch import HALF_SPACE
+
+    links, tip = _arm(1)
+    joints = _servo_joints(1)
+    joints["damping"] = 0.2
+    joints["servo_gain"][:, 1] = 0.0  # the shoulder is free (a torque drive told to do nothing); servos hold the rest
+    pose = np.array([0.0, np.pi / 2, 0.0, 0.0, 0.0], dtype=np.float32)  # shoulder out horizontally, free to fall
+    table = {"kind": HALF_SPACE, "a": (0.0, 0.0, 0.0), "b": (0.0, 0.0, 1.0)}
+    batch = Arm3DBatch(links, joints, tip, device="cpu", obstacles=_obstacles(1, table))
+    batch.reset(pose)
+    command = pose.copy()
+    command[1] = 0.0  # no shoulder torque
+    for _ in range(400):
+        batch.step(command[None])
+    q = batch.truth.numpy()[0, :JOINTS].astype(np.float64)
+    assert np.abs(batch.truth.numpy()[0, JOINTS:]).max() < 0.02  # at rest, but for the servos' hold dither
+
+    def t(a: np.ndarray) -> torch.Tensor:
+        return torch.as_tensor(np.asarray(a), dtype=torch.float64)
+
+    _, bias = arm3d_dynamics(t(q[None]), t(np.zeros((1, JOINTS))), t(links["joint_pos"]), t(links["axis"]), t(links["com"]),
+                             t(links["mass"]), t(links["inertia"]))
+    point, _ = arm3d_tool(t(q[None]), t(links["joint_pos"]), t(links["axis"]), t(tip))
+    lever = float(point[0, 0])  # the contact is at the tool end, straight below it; the shoulder turns about y at x = 0
+    force = float(batch.contact.numpy()[0, 0])
+    assert abs(force * lever - abs(float(bias[0, 1]))) < 0.05 * abs(float(bias[0, 1]))
+    assert float(point[0, 2]) > links["radius"][0, -1] - 0.003  # resting on the surface, barely in it
+
+
+def test_a_falling_arm_does_not_tunnel_through_the_table() -> None:
+    from robot_ai.sim.arm3d_batch import HALF_SPACE
+
+    links, tip = _arm(1)
+    joints = _healthy_joints(1, limit=10.0)
+    table = {"kind": HALF_SPACE, "a": (0.0, 0.0, 0.0), "b": (0.0, 0.0, 1.0)}
+    batch = Arm3DBatch(links, joints, tip, device="cpu", obstacles=_obstacles(1, table))
+    batch.reset(np.array([0.0, 1.2, 0.3, 0.2, 0.0]))
+    lowest = 1.0
+    command = np.zeros((1, JOINTS), dtype=np.float32)
+    command[0, 1] = 1.0  # the shoulder drives the arm down as hard as it can
+    for _ in range(150):
+        batch.step(command)
+        lowest = min(lowest, float(batch.tip.numpy()[0, 2]) - float(links["radius"][0, -1]))
+    assert lowest > -0.005 and float(batch.contact.numpy()[0, 2]) > 5.0  # it hit, and stayed on top
+
+
+def test_a_post_stops_an_arm_swinging_into_it() -> None:
+    from robot_ai.sim.arm3d_batch import CAPSULE
+
+    links, tip = _arm(1)
+    joints = _healthy_joints(1, limit=10.0)
+    pose = np.array([0.0, np.pi / 2, 0.0, 0.0, 0.0])
+    joints["q_min"][:, 1:] = joints["q_max"][:, 1:] = pose[1:]
+    angle = 0.6  # a vertical post at this bearing, half way along the arm
+    post = {"kind": CAPSULE, "a": (0.25 * np.cos(angle), 0.25 * np.sin(angle), 0.0),
+            "b": (0.25 * np.cos(angle), 0.25 * np.sin(angle), 0.3), "radius": 0.02}
+    batch = Arm3DBatch(links, joints, tip, device="cpu", obstacles=_obstacles(1, post))
+    batch.reset(pose)
+    command = np.zeros((1, JOINTS), dtype=np.float32)
+    command[0, 0] = 0.5
+    for _ in range(150):
+        batch.step(command)
+    yaw = float(batch.truth.numpy()[0, 0])
+    assert 0.3 < yaw < angle and float(batch.contact.numpy()[0, 0]) > 1.0  # pressed against the post, not through it

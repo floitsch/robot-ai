@@ -61,6 +61,25 @@ class Link3D:
     gear_loss: float  # extra dry friction per unit of load torque the joint's gears carry
     bearing_loss: float  # extra dry friction per unit of tipping moment on the joint's bearing
     compliance: float  # bend of the link at its root per unit of bending moment, rad / (N m)
+    radius: float  # the link's collision capsule around its axis (joint to next joint, or to the tool point), m
+
+
+MAX_OBSTACLES = 2
+NO_OBSTACLE, HALF_SPACE, CAPSULE = 0, 1, 2
+CONTACT_SLIP = 0.05  # m/s over which contact friction builds up (regularized Coulomb; stiffer is unstable explicitly)
+
+
+@wp.struct
+class Obstacle:
+    """Something the arm can run into. It is not part of the controller's input: it is only felt."""
+
+    kind: int  # NO_OBSTACLE, HALF_SPACE (a wall, a table top) or CAPSULE (a post, a box edge, a forearm)
+    a: wp.vec3  # half-space: a point on its surface; capsule: one end of its axis
+    b: wp.vec3  # half-space: the outward unit normal; capsule: the other end of its axis
+    radius: float  # capsule radius, m
+    stiffness: float  # N/m of penetration
+    damping: float  # N s/m, on approach and separation, never pulling
+    friction: float  # Coulomb coefficient
 
 
 @wp.func
@@ -77,6 +96,41 @@ def _joint(params: wp.array2d(dtype=JointParams), changed_params: wp.array2d(dty
     if changed:
         return changed_params[w, k]
     return params[w, k]
+
+
+@wp.func
+def _closest_on_segments(p0: wp.vec3, p1: wp.vec3, q0: wp.vec3, q1: wp.vec3) -> wp.vec2:
+    """Parameters (s, t) in [0, 1] of the closest points p0 + s (p1 - p0) and q0 + t (q1 - q0) (Ericson 5.1.9)."""
+
+    d1 = p1 - p0
+    d2 = q1 - q0
+    r = p0 - q0
+    a = wp.dot(d1, d1)
+    e = wp.dot(d2, d2)
+    f = wp.dot(d2, r)
+    s = float(0.0)
+    t = float(0.0)
+    if a <= 1.0e-12 and e <= 1.0e-12:
+        return wp.vec2(0.0, 0.0)
+    if a <= 1.0e-12:
+        t = wp.clamp(f / e, 0.0, 1.0)
+        return wp.vec2(0.0, t)
+    c = wp.dot(d1, r)
+    if e <= 1.0e-12:
+        s = wp.clamp(-c / a, 0.0, 1.0)
+        return wp.vec2(s, 0.0)
+    b = wp.dot(d1, d2)
+    denominator = a * e - b * b
+    if denominator > 1.0e-12:
+        s = wp.clamp((b * f - c * e) / denominator, 0.0, 1.0)
+    t = (b * s + f) / e
+    if t < 0.0:
+        t = 0.0
+        s = wp.clamp(-c / a, 0.0, 1.0)
+    elif t > 1.0:
+        t = 1.0
+        s = wp.clamp((b - c) / a, 0.0, 1.0)
+    return wp.vec2(s, t)
 
 
 @wp.func
@@ -133,6 +187,8 @@ def _step_tick(
     tip: wp.array(dtype=wp.vec3),
     tool_axis: wp.array(dtype=wp.vec3),
     metrics: wp.array2d(dtype=wp.float32),
+    obstacles: wp.array2d(dtype=Obstacle),
+    contact: wp.array2d(dtype=wp.float32),
     dt: float,
     substeps: int,
 ):
@@ -140,6 +196,8 @@ def _step_tick(
     tick = ticks[w]
     changed = tick >= change_tick[w]
     g = gravity[w]
+    contact[w, 1] = 0.0  # peak of this tick
+    contact[w, 3] = 0.0  # impulse of this tick
     for j in range(n):
         stiffness_ring[w, j, tick % RING_DEPTH] = stiffness[w, j]
         if params[w, j].servo_gain > 0.0:
@@ -292,6 +350,60 @@ def _step_tick(
                 # the damping, or explicit integration rings up at a thousand rad/s and explodes.
                 mass[w, k, k] = mass[w, k, k] + dt * (p.mesh_damping + dt * p.mesh_stiffness)
 
+        # Contacts with obstacles: every link is a capsule from its joint to the next (the last one to the tool point).
+        # A penetrating point gets a spring-damper force along the obstacle's normal and regularized Coulomb friction
+        # across it; its Jacobian carries that force to every joint below.
+        pressing = float(0.0)
+        for k in range(1, n):  # the first link is the base, mounted where it stands
+            link = _link(links, changed_links, w, k, changed)
+            start = origin[w, k]
+            end = start + rot[w, k] * tip_offset[w]
+            if k + 1 < n:
+                end = origin[w, k + 1]
+            for o in range(MAX_OBSTACLES):
+                obstacle = obstacles[w, o]
+                if obstacle.kind == NO_OBSTACLE:
+                    continue
+                for side in range(2):
+                    point = start
+                    normal = wp.vec3(0.0, 0.0, 1.0)
+                    depth = float(-1.0)
+                    if obstacle.kind == HALF_SPACE:
+                        if side == 1:
+                            point = end
+                        normal = obstacle.b
+                        depth = link.radius - wp.dot(point - obstacle.a, normal)
+                        point = point - normal * link.radius  # the capsule's surface point deepest in the obstacle
+                    elif side == 0:  # a capsule touches a segment in one place
+                        st = _closest_on_segments(start, end, obstacle.a, obstacle.b)
+                        point = start + (end - start) * st[0]
+                        nearest = obstacle.a + (obstacle.b - obstacle.a) * st[1]
+                        gap = point - nearest
+                        distance = wp.length(gap)
+                        if distance > 1.0e-9:
+                            normal = gap / distance
+                        depth = link.radius + obstacle.radius - distance
+                        point = point - normal * link.radius
+                    if depth <= 0.0:
+                        continue
+                    velocity = wp.vec3(0.0, 0.0, 0.0)
+                    for i in range(k + 1):
+                        velocity = velocity + wp.cross(axis_world[w, i], point - origin[w, i]) * states[w, i].dq
+                    approach = wp.dot(velocity, normal)
+                    push_force = wp.max(0.0, obstacle.stiffness * depth - obstacle.damping * approach)
+                    slide = velocity - normal * approach
+                    speed = wp.length(slide)
+                    reaction = normal * push_force
+                    if speed > 1.0e-9:
+                        reaction = reaction - slide * (obstacle.friction * push_force * wp.tanh(speed / CONTACT_SLIP) / speed)
+                    for i in range(k + 1):
+                        scratch[w, 6, i] = scratch[w, 6, i] + wp.dot(wp.cross(axis_world[w, i], point - origin[w, i]), reaction)
+                    pressing = pressing + push_force
+        contact[w, 0] = pressing
+        contact[w, 1] = wp.max(contact[w, 1], pressing)
+        contact[w, 2] = wp.max(contact[w, 2], pressing)
+        contact[w, 3] = contact[w, 3] + pressing * dt
+
         # Invert M by Gauss-Jordan (small, symmetric positive definite; no pivoting needed).
         for i in range(n):
             for j in range(n):
@@ -399,10 +511,13 @@ def _reset(
     bend: wp.array2d(dtype=wp.vec3),
     scratch: wp.array3d(dtype=wp.float32),
     stiffness_ring: wp.array3d(dtype=wp.float32),
+    contact: wp.array2d(dtype=wp.float32),
 ):
     w = wp.tid()
     if mask[w] == 0:
         return
+    for c in range(4):
+        contact[w, c] = 0.0
     state = rng[w]
     for j in range(n):
         p = params[w, j]
@@ -448,7 +563,7 @@ class Arm3DBatch:
     def __init__(self, links: np.ndarray, joints: np.ndarray, tip_offset: np.ndarray, *, device: str = "cuda:0",
                  physics_dt: float = 0.001, substeps: int = 10, seed: int = 0, gravity: float | np.ndarray = 9.81,
                  changed: tuple[np.ndarray, np.ndarray] | None = None, change_tick: np.ndarray | None = None,
-                 push: np.ndarray | None = None) -> None:
+                 push: np.ndarray | None = None, obstacles: np.ndarray | None = None) -> None:
         if links.ndim != 2 or joints.shape != links.shape:
             raise ValueError("expected links and joints as [worlds, joints]")
         self.worlds, self.joints = links.shape
@@ -504,6 +619,11 @@ class Arm3DBatch:
         self.tip = wp.zeros(w, dtype=wp.vec3, device=device)
         self.tool_axis = wp.zeros(w, dtype=wp.vec3, device=device)
         self.metrics = wp.zeros((w, METRIC_DIM + 2 * n), dtype=wp.float32, device=device)
+        # Obstacles [worlds, MAX_OBSTACLES] of `Obstacle`; contact: pressing force now, peak this tick, peak so far (N),
+        # impulse this tick (N s).
+        none = np.zeros((w, MAX_OBSTACLES), dtype=Obstacle.numpy_dtype())
+        self.obstacles = wp.array(none if obstacles is None else obstacles, dtype=Obstacle, device=device)
+        self.contact = wp.zeros((w, 4), dtype=wp.float32, device=device)
         self._shared = [self.params, self.states, self.command_ring, self.encoder_ring, self.ticks, self.rng,
                         self.observation, self.truth, self.metrics]
 
@@ -512,7 +632,7 @@ class Arm3DBatch:
         start = np.ascontiguousarray(np.broadcast_to(np.asarray(start_q, dtype=np.float32), (self.worlds, self.joints)))
         wp.launch(_reset, dim=self.worlds, device=self.device,
                   inputs=[self.joints, wp.array(mask_values, device=self.device), wp.array(start, device=self.device), *self._shared,
-                          self.bend, self.scratch, self.stiffness_ring])
+                          self.bend, self.scratch, self.stiffness_ring, self.contact])
 
     def step(self, commands: object, stiffness: object = None) -> None:
         """`stiffness` [worlds, joints] scales each position servo's gain (1 = as tuned); ignored by torque drives."""
@@ -531,7 +651,8 @@ class Arm3DBatch:
                           self.params, self.changed_params, self.push, self.states, source, self.command_ring,
                           scale, self.stiffness_ring, self.encoder_ring, self.ticks, self.rng, self.rot, self.origin, self.axis_world, self.centre,
                           self.omega, self.force, self.moment, self.load_force, self.load_moment, self.bend, self.mass, self.inverse, self.scratch, self.observation,
-                          self.truth, self.tip, self.tool_axis, self.metrics, self.physics_dt, self.substeps])
+                          self.truth, self.tip, self.tool_axis, self.metrics, self.obstacles, self.contact, self.physics_dt,
+                          self.substeps])
 
     def synchronize(self) -> None:
         wp.synchronize_device(self.device)
