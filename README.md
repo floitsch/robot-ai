@@ -138,6 +138,59 @@ these arms. A cheap arm's loop delay then sits inside the loop that holds the ar
 [docs/RESEARCH_ACTION_SPACE.md](docs/RESEARCH_ACTION_SPACE.md) summarizes what real servos and related
 work look like.
 
+## The SO-101
+
+The [SO-101](https://github.com/TheRobotStudio/SO-ARM100) is LeRobot's open desktop arm, built from Feetech STS3215
+servos. It now exists in the simulator, taken from the official model
+([so101_new_calib.urdf](https://github.com/TheRobotStudio/SO-ARM100/blob/main/Simulation/SO101/so101_new_calib.urdf)).
+The simulated arm moves exactly like the URDF describes, agrees with MuJoCo to 2 mrad and 2 mm, and has the same
+servos and defects as above.
+
+![SO-101: servos sent the IK angles vs our network](docs/media/so101.gif)
+
+*Six worn SO-101s. Top: the servos are sent the joint angles for the goal. Bottom: our network, trained on
+SO-101s.*
+
+| Success on SO-101s: gripper within 5 mm and 30 mrad, arm at rest | Healthy | Moderately worn | Badly worn | Worst |
+| --- | --- | --- | --- | --- |
+| Servos sent the inverse-kinematics angles | 20% | 17% | 15% | 11% |
+| The desktop-arm network with its hold, never trained on an SO-101 | 55% | 51% | 42% | 22% |
+| **The network after training on SO-101s** | **81%** | **87%** | **88%** | **73%** |
+
+*4,096 test arms per column. Median final error 1.5–3.2 mm.*
+
+## Obstacles: running into something, and feeling for a surface
+
+The arm can now hit things: walls, boxes, posts, plates. It has no force sensor, so it can only feel a
+contact through its motor currents and positions, like a real servo arm. The controller learns two new
+things:
+- **Something in the way.** An obstacle it was not told about blocks the path. It has to notice the
+  blow, stop, back off, and stay off.
+- **Find the surface.** It is told to move straight towards a surface whose exact position it does not
+  know. It has to arrive gently and rest against it with a light force (0.5–10 N).
+
+For this the network got one more output, a brake. The brake holds the arm where it is, or backs it off.
+
+![Obstacles: servos sent the IK angles vs our network](docs/media/contact.gif)
+
+*Three arms with something in the way and three finding a surface (moderately worn); the number is the
+contact force. Top: the servos are sent the joint angles for the goal and push on. Bottom: our network. It
+backs off after a blow, and it reaches surfaces with a tenth of the force, but it does not always end in
+the 0.5–10 N band. It rests at 0.3 N on the right, and it misses the plate on the left.*
+
+| On 4,096 test arms (healthy / half worn / worst) | Servos sent the IK angles | Classical collision reflex | **Our network** |
+| --- | --- | --- | --- |
+| Something in the way: stopped and let go | 22% / 32% / 38% | 50% / 54% / 57% | **72% / 69% / 60%** |
+| Pushing after the blow | 10.6 / 20.6 / 16.2 N s | 2.3 / 4.5 / 5.1 N s | **1.1 / 3.9 / 5.0 N s** |
+| Found the surface: in the force band, at rest | 0% / 0% / 0% | 0% / 1% / 1% | **14% / 6% / 3%** |
+| Hardest impact on the surface (median) | 28 / 190 / 415 N | 9 / 11 / 0 N | **7 / 16 / 82 N** |
+
+The classical reflex is what industrial drives do: it detects a stall from following error and then backs off.
+It stops blows, but it also brakes on ordinary moves whenever a worn servo stalls short of its target. Its
+guarded approach to a surface rarely arrives at all. Touching a surface is the weakest skill so far. The network
+learned it by imitating a scripted teacher that knows the true contact force, and the teacher itself succeeds
+only 30% of the time on healthy arms. [docs/ARM3D.md](docs/ARM3D.md) has the details.
+
 ## Several limbs on top of each other (in progress, not solved)
 
 Mount a second arm on the tip of the first and the two stop being independent: the lower arm carries
@@ -189,6 +242,8 @@ tried; [docs/HANDOVER.md](docs/HANDOVER.md) has the current state and what to do
 | `src/robot_ai/control/c_export.py` | Export to a single C file |
 | `src/robot_ai/sim/arm3d_batch.py`, `arm3d_env.py` | 3D arms: fused simulator (bending, load-dependent friction, position servos) and the tool-pose task |
 | `src/robot_ai/control/pid3d.py`, `control/settle.py`, `visualize/animate3d.py` | The 3D PID baseline; the in-position hold; 3D replays |
+| `src/robot_ai/sim/so101.py` | The SO-101, from its URDF |
+| `src/robot_ai/control/reflex.py`, `control/contact_expert.py` | Classical collision reflex and guarded move; the scripted contact teacher |
 | `docs/ARM3D.md`, `docs/RESEARCH_ACTION_SPACE.md` | The 3D phase; what real cheap arms accept |
 | `docs/REACH.md` | Method, results, how to run |
 | `docs/MULTILIMB.md`, `docs/HANDOVER.md` | The stacked-limb experiment; the state of the work and next steps |
@@ -201,9 +256,8 @@ The GPU used for all numbers above is a GeForce GTX 1650 (4 GB).
 
 ## What comes next
 
-- On 3D servo arms: getting the worst arms to settle, and obstacles. That means feeling for a wall on
-  purpose, and braking safely after an unexpected hit, both from the motor current.
+- Touching surfaces reliably, with a better teacher for the guarded approach, and contact on the SO-101.
 - Stacked limbs, retried with the lessons from 3D. The servo interface, and a training step size that
   follows how far each update moves the network, are both likely to help there.
-- Eventually a real arm. An SO-101 is the obvious candidate: its servos are exactly what the simulator
-  now models.
+- A real SO-101. The simulator now models it and its servos, and the next step is to check the model against the
+  real arm: log its servo positions and currents, and fit the servo model to them.

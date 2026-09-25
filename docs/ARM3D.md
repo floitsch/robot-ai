@@ -226,3 +226,93 @@ Final evaluation, on 4,096 held-out arms per severity with mid-move changes:
 | Network, no hold | 69.2% (1.7 mm) | 72.9% | 72.4% | 53.0% (3.7 mm) |
 | **Network + in-position hold** (`artifacts/reach/arm3d-final`) | **81.7%** (1.5 mm) | **82.5%** | **81.1%** | **60.1%** (3.8 mm) |
 | Network with stiffness control + hold | 82.4% | 83.2% | 82.2% | 58.0% |
+
+## Obstacles
+
+### Contact
+
+Every moving link is a capsule. Obstacles are half-spaces (a table top), capsules (a post, a limb) and
+oriented boxes (a plate, a crate, a body). A penetrating point gets a spring-damper force along the normal
+and regularized Coulomb friction across it. The damping grows with the square root of the stiffness: without
+it a servo pushing into a stiff surface rings against it. The force reaches every joint below through the
+contact point's Jacobian.
+
+Tests: an arm resting on a table is held by exactly the force that balances its gravity torque; a hard
+fall does not tunnel; a post stops a swinging arm; an arm rests on a plate and swings past one beside it.
+
+### Tasks
+
+- **Something in the way.** A box across the tool's straight path, or a thick post, clear of the arm at the
+  start and at the goal. The controller is not told. After the first blow the reward only counts letting go
+  and keeping still. Success: contact released within 0.3 s, at most 1 N in the last 0.3 s, at rest. The
+  first impact is set by physics before any controller can react, so the push afterwards is also reported as
+  an impulse (N s).
+- **Find the surface.** It works like a guarded linear move on a real arm:
+  - The arm starts 3–8 cm in front of a plate, pointing at it.
+  - The goal slides along the tool's direction at 5–10 cm/s, towards a point 2–6 cm behind the surface. Its
+    inverse-kinematics solution follows continuously.
+  - Success: 0.5–10 N of contact force throughout the last 0.3 s, no impact above 20 N, and at rest. The tool
+    must be within 5 mm of the surface in depth (sideways error counts at half weight) and within 30 mrad of
+    the goal direction.
+
+The network gets one more input, the touch flag, and one more output, a brake b from 0 to 1.5:
+- Up to 1, b pulls every servo target towards an anchor. While the brake is light the anchor is where the
+  arm is now, which gives a guarded creep. From 0.95 on the anchor stays where the arm was, so b = 1 holds
+  the arm there.
+- Beyond 1, b backs the arm off from the anchor by up to 0.05 rad.
+
+### What it took
+
+- **Pure PPO did not find braking.** Warm-started from the servo network, 120 iterations left accidents and
+  touches unchanged. The skills come from a scripted teacher (`control/contact_expert.py`): the trained
+  reaching policy's targets plus a rule-based brake that knows the true contact force. DAgger distillation
+  copies it into a student that has to recognize contact from feel. PPO afterwards did not add to it.
+- **Geometry mistakes.**
+  - An infinite wall across the tool's direction gets hit by other links long before the tool: the
+    arm's path sweeps through the plane.
+  - A plate hit from a random start is clipped sideways.
+  - Moving through joint space towards a touch goal curves the tool 4 cm sideways.
+
+  Plates, pre-contact start poses and sliding goals fixed these.
+- **The classical baseline needed three designs.** A current residual against a gravity model fires on
+  every move start. A high-pass current residual cannot tell a move start from a blow. The working one is
+  stall detection on following-error progress. Velocity thresholds fail because a single count of encoder
+  flicker, differenced at 100 Hz, is already 0.07 rad/s.
+
+### Results (`artifacts/reach/arm3d-contact-seed`, 4,096 held-out desktop servo arms)
+
+Each cell gives healthy / half worn / worst.
+
+| | Servos sent the IK angles | Classical reflex | Network |
+| --- | --- | --- | --- |
+| Reach, among contact tasks | 14% / 10% / 8% | 10% / 8% / 6% | 64% / 69% / 54% |
+| Something in the way | 22% / 32% / 38% | 50% / 54% / 57% | 72% / 69% / 60% |
+| Impulse after the blow | 10.6 / 20.6 / 16.2 N s | 2.3 / 4.5 / 5.1 N s | 1.1 / 3.9 / 5.0 N s |
+| Find the surface | 0% / 0% / 0% | 0% / 1% / 1% | 14% / 6% / 3% |
+| Peak touch force (median) | 28 / 190 / 415 N | 9 / 11 / 0 N | 7 / 16 / 82 N |
+
+Touch is the weak skill. The network arrives gently on healthy arms, but its final pose and force are looser
+than its teacher's (depth within tolerance 28% of the time against 67%; the force band 49%). The teacher
+itself reaches only 30% healthy and 3% worst.
+
+## The SO-101
+
+`src/robot_ai/sim/so101.py` takes TheRobotStudio's `so101_new_calib.urdf`. URDF joints have fixed rotations
+between links, and the simulator's links do not. With P_k the product of the fixed rotations up to joint k,
+the chain is rewritten as follows:
+- joint k's axis becomes P_k a_k;
+- its position in the previous link becomes P_{k-1} p_k;
+- link k's centre of mass becomes P_k c_k, and its inertia P_k I_k P_k^T.
+
+The rewritten chain moves exactly like the URDF, and the kernel agrees with MuJoCo on it to 2 mrad and
+2 mm. The closed jaw's mass is lumped into the gripper. Every joint is an STS3215 servo, rated at about
+2.5 N m and 5 rad/s. Arm designs are `ArmModel`s: the SO-101's dimensions are fixed, and its masses vary by
+±10%. Its IK hint comes from the solver its goals are sampled with, plus damped-least-squares continuation
+for sliding goals (the closed form is for the desktop layout only).
+
+| SO-101s (4,096 per column) | Healthy | 0.25 | 0.5 | Worst |
+| --- | --- | --- | --- | --- |
+| Servos sent the IK angles | 19.7% (8.3 mm) | 16.6% | 14.5% | 10.7% (14.5 mm) |
+| Desktop network + hold, never trained on an SO-101 | 55.1% | 51.4% | 41.9% | 22.2% |
+| SO-101 network (`so101-servo/best`, 600 iterations from the desktop one) | 67.5% | 75.4% | 78.5% | 66.0% |
+| SO-101 network + hold | 81.4% (1.5 mm) | 86.8% | 88.1% | 72.5% (3.2 mm) |
