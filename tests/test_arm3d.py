@@ -415,3 +415,26 @@ def test_a_post_stops_an_arm_swinging_into_it() -> None:
         batch.step(command)
     yaw = float(batch.truth.numpy()[0, 0])
     assert 0.3 < yaw < angle and float(batch.contact.numpy()[0, 0]) > 1.0  # pressed against the post, not through it
+
+
+def test_an_arm_comes_to_rest_on_a_plate_and_not_beside_it() -> None:
+    from robot_ai.sim.arm3d_batch import BOX
+
+    links, tip = _arm(2)
+    joints = _servo_joints(2)
+    joints["servo_gain"][:, 1] = 0.0  # the shoulder is free; servos hold the rest
+    pose = np.array([0.0, np.pi / 2, 0.0, 0.0, 0.0], dtype=np.float32)
+    reach = float(links["joint_pos"][0, 2:, 2].sum() + tip[0, 2])
+    plate = {"kind": BOX, "b": (0.0, 0.0, 1.0), "side": (1.0, 0.0, 0.0), "half": (0.05, 0.05, 0.01)}
+    obstacles = _obstacles(2, plate)
+    obstacles["a"][0, 0] = (reach - 0.03, 0.0, -0.01)  # under the tool
+    obstacles["a"][1, 0] = (reach - 0.03, 0.3, -0.01)  # off to the side
+    batch = Arm3DBatch(links, joints, tip, device="cpu", obstacles=obstacles)
+    batch.reset(pose)
+    command = pose.copy()
+    command[1] = 0.0
+    for _ in range(300):
+        batch.step(np.tile(command, (2, 1)))
+    contact, tip_z = batch.contact.numpy()[:, 0], batch.tip.numpy()[:, 2]
+    assert contact[0] > 1.0 and abs(tip_z[0] - links["radius"][0, -1]) < 0.005  # resting on the plate's top face
+    assert contact[1] == 0.0 and tip_z[1] < -0.05  # nothing there: it swung on down

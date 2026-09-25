@@ -65,7 +65,8 @@ class Link3D:
 
 
 MAX_OBSTACLES = 2
-NO_OBSTACLE, HALF_SPACE, CAPSULE = 0, 1, 2
+NO_OBSTACLE, HALF_SPACE, CAPSULE, BOX = 0, 1, 2, 3
+BOX_SAMPLES = 5  # points along each link capsule tested against a box
 CONTACT_SLIP = 0.05  # m/s over which contact friction builds up (regularized Coulomb; stiffer is unstable explicitly)
 
 
@@ -73,10 +74,12 @@ CONTACT_SLIP = 0.05  # m/s over which contact friction builds up (regularized Co
 class Obstacle:
     """Something the arm can run into. It is not part of the controller's input: it is only felt."""
 
-    kind: int  # NO_OBSTACLE, HALF_SPACE (a wall, a table top) or CAPSULE (a post, a box edge, a forearm)
-    a: wp.vec3  # half-space: a point on its surface; capsule: one end of its axis
-    b: wp.vec3  # half-space: the outward unit normal; capsule: the other end of its axis
+    kind: int  # NO_OBSTACLE, HALF_SPACE (a table top), CAPSULE (a post, a forearm) or BOX (a plate, a crate, a body)
+    a: wp.vec3  # half-space: a point on its surface; capsule: one end of its axis; box: its centre
+    b: wp.vec3  # half-space: the outward unit normal; capsule: the other end of its axis; box: its local z axis
     radius: float  # capsule radius, m
+    side: wp.vec3  # box: its local x axis, perpendicular to b
+    half: wp.vec3  # box: half its size along x, y, z, m
     stiffness: float  # N/m of penetration
     damping: float  # N s/m, on approach and separation, never pulling
     friction: float  # Coulomb coefficient
@@ -364,17 +367,46 @@ def _step_tick(
                 obstacle = obstacles[w, o]
                 if obstacle.kind == NO_OBSTACLE:
                     continue
-                for side in range(2):
+                for side in range(BOX_SAMPLES):
                     point = start
                     normal = wp.vec3(0.0, 0.0, 1.0)
                     depth = float(-1.0)
-                    if obstacle.kind == HALF_SPACE:
+                    if obstacle.kind == BOX:
+                        # A sphere at a point along the link against an oriented box.
+                        point = start + (end - start) * (float(side) / float(BOX_SAMPLES - 1))
+                        y_axis = wp.cross(obstacle.b, obstacle.side)
+                        offset = point - obstacle.a
+                        local = wp.vec3(wp.dot(offset, obstacle.side), wp.dot(offset, y_axis), wp.dot(offset, obstacle.b))
+                        clamped = wp.vec3(wp.clamp(local[0], -obstacle.half[0], obstacle.half[0]),
+                                          wp.clamp(local[1], -obstacle.half[1], obstacle.half[1]),
+                                          wp.clamp(local[2], -obstacle.half[2], obstacle.half[2]))
+                        outside = local - clamped
+                        distance = wp.length(outside)
+                        if distance > 1.0e-9:
+                            local_normal = outside / distance
+                            depth = link.radius - distance
+                        else:
+                            # Inside: out through the nearest face.
+                            gaps = wp.vec3(obstacle.half[0] - wp.abs(local[0]), obstacle.half[1] - wp.abs(local[1]),
+                                           obstacle.half[2] - wp.abs(local[2]))
+                            local_normal = wp.vec3(wp.sign(local[0]), 0.0, 0.0)
+                            face_gap = gaps[0]
+                            if gaps[1] < face_gap:
+                                face_gap = gaps[1]
+                                local_normal = wp.vec3(0.0, wp.sign(local[1]), 0.0)
+                            if gaps[2] < face_gap:
+                                face_gap = gaps[2]
+                                local_normal = wp.vec3(0.0, 0.0, wp.sign(local[2]))
+                            depth = link.radius + face_gap
+                        normal = obstacle.side * local_normal[0] + y_axis * local_normal[1] + obstacle.b * local_normal[2]
+                        point = point - normal * link.radius
+                    elif obstacle.kind == HALF_SPACE and side < 2:
                         if side == 1:
                             point = end
                         normal = obstacle.b
                         depth = link.radius - wp.dot(point - obstacle.a, normal)
                         point = point - normal * link.radius  # the capsule's surface point deepest in the obstacle
-                    elif side == 0:  # a capsule touches a segment in one place
+                    elif obstacle.kind == CAPSULE and side == 0:  # a capsule touches a segment in one place
                         st = _closest_on_segments(start, end, obstacle.a, obstacle.b)
                         point = start + (end - start) * st[0]
                         nearest = obstacle.a + (obstacle.b - obstacle.a) * st[1]

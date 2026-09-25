@@ -562,14 +562,21 @@ def distill(*, teacher: Path, output: Path, device: str, worlds: int, iterations
             raise ValueError("the computed-torque teacher drives chains; use --limbs (1 for a single arm)")
         oracle: Actor = ComputedTorqueTeacher(env, omega=teacher_omega, measured=teacher_memoryless,
                                               ramp=not teacher_memoryless).to(dev)  # type: ignore[assignment]
+    elif str(teacher).startswith("contact-expert:"):
+        # Scripted contact skills on top of a trained reaching policy (see `control/contact_expert.py`).
+        from ..control.contact_expert import ContactExpert
+
+        oracle = ContactExpert(env, load_actor(Path(str(teacher).split(":", 1)[1]), dev)).to(dev)  # type: ignore[arg-type,assignment]
     else:
         oracle = load_actor(teacher, dev)
     if not oracle.oracle:
         raise ValueError("the teacher must be an oracle run")
-    if oracle.n != getattr(env, "n", 2):
+    if oracle.n != getattr(env, "action_dim", getattr(env, "n", 2)):
         raise ValueError("the teacher was trained for a different joint count")
     if initial:
         student = load_actor(initial, dev).train()
+        if student.n < oracle.n or student.observation_dim < getattr(env, "observation_dim", student.observation_dim):
+            student = widen_actions(student, oracle.n, env_layout(env), env_privileged_dim(env)).train()
     elif per_limb:
         from .limbs import LimbPolicy
 
