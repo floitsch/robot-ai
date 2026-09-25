@@ -191,3 +191,38 @@ still have a hunting servo at the end.
 | Worse | Target hysteresis | |
 | No gain | Loosening the reward tolerance to the success bar | |
 | Slower | A wider network (384) with an insight head | Learned more slowly than 256 without. |
+
+### Consistent servo arms, and the in-position hold
+
+A single-defect ablation on the worst arms showed that three of the four damaging defects were leftovers
+of the torque setup, which a real servo arm cannot have:
+- **A worse sensor for the host than for the servo.** The host read a noisier and coarser encoder than
+  the servo's own. On a servo arm, the host reads that same encoder over the bus.
+- **Motor lag inside the servo's loop.** Up to 40 ms of it, inside a 1 kHz servo loop, makes any servo
+  oscillate by itself. A voltage-driven motor responds within its electrical time constant (0.5–3 ms),
+  and the firmware is tuned for it.
+
+The fixed servo arms take the host's reading from the servo's encoder (about one count of flicker) and
+give each motor 0.5–3 ms of lag. Before any retraining, this alone lifts the network from 37% to 52% on
+the worst arms.
+
+Fine-tuning on the consistent arms first drifted down for 800 iterations (54% → 20% on worn arms), while
+the entropy bonus kept raising the exploration noise. Training now keeps its best checkpoint, judged on
+flawless and on worn arms, and fine-tunes run without an entropy bonus. Even so, fine-tuning barely
+moves the result. A second action per joint that sets each servo's stiffness, its gain register, did not
+beat targets alone.
+
+What did help is an **in-position hold** (`src/robot_ai/control/settle.py`). It freezes the targets a
+second after each goal and releases them when the measured pose error passes 5 mm or 30 mrad. On
+healthy arms a third of the failures were joints still moving at the end, although 96% were within
+5 mm. Part of that motion is the servos themselves: with constant targets, 17% of healthy arms still
+move. The rest is the network answering the servo encoders' one-count flicker.
+
+Final evaluation, on 4,096 held-out arms per severity with mid-move changes:
+
+| Controller | Healthy | 0.25 | 0.5 | 1 (worst) |
+| --- | --- | --- | --- | --- |
+| Servos sent the IK angles | 13.4% (13.0 mm) | 12.0% | 10.0% | 8.2% (20.9 mm) |
+| Network, no hold | 69.2% (1.7 mm) | 72.9% | 72.4% | 53.0% (3.7 mm) |
+| **Network + in-position hold** (`artifacts/reach/arm3d-final`) | **81.7%** (1.5 mm) | **82.5%** | **81.1%** | **60.1%** (3.8 mm) |
+| Network with stiffness control + hold | 82.4% | 83.2% | 82.2% | 58.0% |

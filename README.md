@@ -96,37 +96,43 @@ thing it is told about the arm is its link lengths.
 
 ![3D arms, servos sent the IK angles vs our network](docs/media/arm3d.gif)
 
-*The six test arms that are worst in one respect each. Top: the usual approach, sending every servo
-the joint angles computed from the goal (inverse kinematics). Proportional servos sag under load, so
-the gripper ends 1–5 cm off. Bottom: our network, on the same arms. It learns how far each servo has
-to be over-commanded against gravity, friction, slack and a sagging link. On three of these extreme
-arms it still misses the 5 mm target, by 6–10 mm; the numbers are the final error.*
+*The six test arms that are worst in one respect each. Top: the usual approach, sending every servo the
+joint angles computed from the goal (inverse kinematics). Proportional servos sag under load, so the
+gripper typically ends 2–4 cm off. Bottom: our network, on the same arms. It learns how far each servo
+has to be over-commanded against gravity, friction, slack and a sagging link, then holds still. It
+misses the 5 mm target on the most compliant links (8.7 mm) and the heaviest load drag (6.3 mm); the
+numbers are the final error.*
 
 The simulator adds the defects that matter in 3D:
 - joints that drag more when they carry more, so a turntable under an outstretched arm is stiffer than
   under a folded one;
 - links that bend under their load, from both weight and acceleration;
-- servos with different stiffness, a deadband and a 12-bit encoder;
-- everything listed above: slack, sticky spots, weak and late motors, noisy and late sensors, a
-  payload picked up mid-move.
+- servos with different stiffness, a deadband, a 12-bit encoder that the computer reads over the bus,
+  and a real motor behind them;
+- everything listed above: slack, sticky spots, weak motors, late commands and readings, a payload
+  picked up mid-move.
 
 It agrees with MuJoCo to 2 mrad.
 
 | Success: gripper within 5 mm and 30 mrad, arm at rest | Healthy arms | Moderately worn | Badly worn | Worst |
 | --- | --- | --- | --- | --- |
-| Servos sent the inverse-kinematics angles | 18% | 10% | 6% | 3% |
-| **Our network** | **92%** | **77%** | **69%** | **37%** |
+| Servos sent the inverse-kinematics angles | 13% | 12% | 10% | 8% |
+| **Our network** | **82%** | **83%** | **81%** | **60%** |
 
 *Wear levels are defect severity 0, 0.25, 0.5 and 1. Each row is 4,096 test arms, with payloads,
 fading motors and fouling joints appearing mid-move.*
 
-Median final error is 1.7 mm on healthy arms and 4.4 mm on the worst. On the worst arms, most failures
-are joints that never quite come to rest. Worn servos hunt around their target on their own; even with
-perfectly steady targets, two thirds of those arms still wobble at the end. Holding the targets fixed
-once the gripper has arrived buys a few more points (94% healthy, 39% worst).
+Median final error is 1.5–2.2 mm up to badly worn arms and 3.8 mm on the worst.
+
+The network runs with an **in-position hold**, as industrial motion controllers do. About a second after
+each new goal it stops moving the servo targets, and it releases them as soon as the measured error
+exceeds 5 mm (a picked-up payload, a push). Without it, the network keeps answering the one-count flicker
+of the servo encoders, and the servos follow even that. The hold is worth 13 points on healthy arms.
+What still fails on the worst arms is mostly servos hunting around their target on their own, as
+LeRobot users know them to do on the SO-100 ("to avoid shakiness").
 
 Driving the joints with torque instead, as a classical robotics controller would, is much worse on
-these arms. The loop delay of a cheap arm sits inside the loop that holds the arm still. A controller
+these arms. A cheap arm's loop delay then sits inside the loop that holds the arm still. A controller
 *told* every mass and motor strength reaches 1.4% on the worst arms, and a tuned PID 3%.
 [docs/ARM3D.md](docs/ARM3D.md) has the details, including the dead ends.
 [docs/RESEARCH_ACTION_SPACE.md](docs/RESEARCH_ACTION_SPACE.md) summarizes what real servos and related
@@ -182,7 +188,7 @@ tried; [docs/HANDOVER.md](docs/HANDOVER.md) has the current state and what to do
 | `src/robot_ai/visualize/` | Comparison page, learning curves, animated replays |
 | `src/robot_ai/control/c_export.py` | Export to a single C file |
 | `src/robot_ai/sim/arm3d_batch.py`, `arm3d_env.py` | 3D arms: fused simulator (bending, load-dependent friction, position servos) and the tool-pose task |
-| `src/robot_ai/control/pid3d.py`, `visualize/animate3d.py` | The 3D PID baseline; 3D replays |
+| `src/robot_ai/control/pid3d.py`, `control/settle.py`, `visualize/animate3d.py` | The 3D PID baseline; the in-position hold; 3D replays |
 | `docs/ARM3D.md`, `docs/RESEARCH_ACTION_SPACE.md` | The 3D phase; what real cheap arms accept |
 | `docs/REACH.md` | Method, results, how to run |
 | `docs/MULTILIMB.md`, `docs/HANDOVER.md` | The stacked-limb experiment; the state of the work and next steps |

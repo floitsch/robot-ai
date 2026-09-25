@@ -153,8 +153,10 @@ def main() -> None:
     parser.add_argument("--severity", type=float, default=1.0)
     parser.add_argument("--worlds", type=int, default=1024)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--settle-hold", action="store_true", help="wrap the servo network in the in-position hold")
     args = parser.parse_args()
     from ..control.computed_torque import ComputedTorqueTeacher
+    from ..control.settle import SettleHold
 
     device = torch.device("cuda" if args.device.startswith("cuda") else "cpu")
 
@@ -169,7 +171,8 @@ def main() -> None:
     env, first = record(baseline, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo)
     runs = {"classical": first}
     if network is not None:
-        runs["network"] = record(network, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo)[1]
+        driver: torch.nn.Module = SettleHold(network) if args.settle_hold and servo else network
+        runs["network"] = record(driver, worlds=args.worlds, device=args.device, severity=args.severity, servo=servo)[1]
     picks = pick_robots(env)
     render_gif(runs, picks, args.gif)
     for index, title in picks:
