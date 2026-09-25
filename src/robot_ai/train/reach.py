@@ -33,7 +33,8 @@ EVAL_SEED = 987_654_321
 FINE_ERROR_SCALES = (0.05, 0.5)
 ORACLE_FULL, ORACLE_CONDITION = 1, 2
 # The 3D arm's task codes (`arm3d_env.TASK_CODE`, + 1 with position servos), saved in an Actor's layout.
-ROBOT_BY_TASK = {3: "arm3d", 4: "arm3d-servo", 5: "arm3d-servo-stiff", 6: "arm3d-servo-contact"}
+ROBOT_BY_TASK = {3: "arm3d", 4: "arm3d-servo", 5: "arm3d-servo-stiff", 6: "arm3d-servo-contact",
+                 14: "so101-servo", 16: "so101-servo-contact"}
 # Per joint: the observation holds 6 blocks (q, dq, current, goal, error, previous command); the privileged
 # part starts with true q and dq. The single arm has 2 joints; chains have more.
 OBSERVATION_BLOCKS = 6
@@ -348,11 +349,13 @@ def make_env(worlds: int, *, device: str, seed: int, limbs: int = 0, robot: str 
     """The planar arm, a stacked chain of `limbs` two-joint limbs when `limbs` is given, or the 3D arm."""
 
     allowed = {"severity", "changes", "reward_tolerance", "still_weight", "roughness_weight"}
-    if robot.startswith("arm3d"):
+    if robot.startswith(("arm3d", "so101")):
         from ..sim.arm3d_env import Arm3DEnv
 
-        contact = {"accidents": 0.25, "touches": 0.25} if robot == "arm3d-servo-contact" else {}
-        return Arm3DEnv(worlds, device=device, seed=seed, servo=robot.startswith("arm3d-servo"), stiffness=robot == "arm3d-servo-stiff",
+        contact = {"accidents": 0.25, "touches": 0.25} if robot.endswith("-contact") else {}
+        model = "so101" if robot.startswith("so101") else "desktop"
+        return Arm3DEnv(worlds, device=device, seed=seed, servo="-servo" in robot, stiffness=robot == "arm3d-servo-stiff",
+                        model=model,
                         **contact,  # type: ignore[arg-type]
                         **{k: v for k, v in settings.items() if k in allowed | {"mixed", "hold_weight"}})  # type: ignore[arg-type,return-value]
     if limbs:
@@ -387,6 +390,10 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
             actor = widen_actions(actor, action_dim, env_layout(env), env_privileged_dim(env)).train()
         if actor.n != action_dim:
             raise ValueError("the initial policy was trained for a different joint count")
+        if isinstance(actor, Actor) and hasattr(env, "task_code") and actor.task != env.task_code:
+            # The same inputs and outputs on another robot (the SO-101 from a desktop-arm policy): it now belongs to that.
+            actor.layout[0] = int(env.task_code)
+            actor.task = int(env.task_code)
         if oracle and not int(actor.oracle):
             actor = widen_to_oracle(actor, env_privileged_dim(env), getattr(env, "initial_std", None)).train()
         # A distilled policy never trained its exploration; start fine-tuning gently, scaled per joint by rated torque.
@@ -735,8 +742,8 @@ def main() -> None:
         sub.add_argument("--identity", action="store_true", help="each limb is told its slot in the chain (per-limb only)")
 
     for sub in (fit, teach):
-        sub.add_argument("--robot", choices=("planar", "arm3d", "arm3d-servo", "arm3d-servo-stiff", "arm3d-servo-contact"),
-                         default="planar",
+        sub.add_argument("--robot", choices=("planar", "arm3d", "arm3d-servo", "arm3d-servo-stiff", "arm3d-servo-contact",
+                                              "so101-servo", "so101-servo-contact"), default="planar",
                          help="arm3d: five-joint 3D arms with tool-pose goals, driven by torque, by position servos, or by "
                               "position servos whose stiffness the network also sets")
         sub.add_argument("--mixed", action="store_true", help="train on robots from flawless to badly worn, some pushed around")

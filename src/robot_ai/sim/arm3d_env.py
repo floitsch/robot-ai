@@ -114,27 +114,70 @@ def sample_servos(rng: np.random.Generator, joints: np.ndarray) -> None:
     joints["motor_alpha"] = 1.0 - np.exp(-0.001 / rng.uniform(0.0005, 0.003, shape))
 
 
+@dataclass(frozen=True)
+class ArmModel:
+    """What differs between arm designs: every one has five joints, base yaw, three pitches and a tool roll."""
+
+    name: str
+    torques: np.ndarray  # rated stall torque per joint, N m
+    limits: np.ndarray  # [n, 2] rad
+    goal_low: np.ndarray  # goals and starts are sampled in this joint range
+    goal_high: np.ndarray
+    bend_at_rated: np.ndarray  # largest root bend per link at its motor's rated torque, rad
+    no_load_speed: tuple[float, float]  # rad/s range at the joint
+    closed_form: bool  # whether `arm3d_inverse` applies (the desktop layout: every link along its own z)
+
+    @property
+    def friction_scale(self) -> np.ndarray:
+        return self.torques / 3.0
+
+
+DESKTOP = ArmModel("desktop", NOMINAL_TORQUES, LIMITS, -GOAL_SPAN, GOAL_SPAN, BEND_AT_RATED, (4.0, 10.0), True)
+
+
+def _so101_model() -> ArmModel:
+    from . import so101
+
+    low, high = so101.LIMITS[:, 0], so101.LIMITS[:, 1]
+    middle, half = (low + high) / 2.0, (high - low) / 2.0
+    return ArmModel("so101", so101.NOMINAL_TORQUES, so101.LIMITS, middle - 0.75 * half, middle + 0.75 * half,
+                    np.full(JOINTS, 0.02), (4.5, 6.0), False)
+
+
+SO101 = _so101_model()
+MODELS = {model.name: model for model in (DESKTOP, SO101)}
+
+
 def sample_arm3d_population(rng: np.random.Generator, worlds: int, *, severity: float | np.ndarray = 1.0,
-                            friction_probability: float = 0.7) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+                            friction_probability: float = 0.7, model: ArmModel = DESKTOP) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     per_robot, column = _per_world(severity, worlds)
     shape = (worlds, JOINTS)
-    lengths = LENGTHS * (1.0 + column * rng.uniform(-0.15, 0.15, shape))
-    masses = MASSES * (1.0 + column * rng.uniform(-0.20, 0.20, shape))
-    side = TOOL_SIDE_OFFSET * (1.0 + per_robot * rng.uniform(-0.5, 0.5, worlds))
-    links, tip = _links(lengths, masses, side)
-    add_tool_mass(links, tip, np.where(rng.random(worlds) < 0.5, rng.uniform(0.0, 0.15, worlds), 0.0) * per_robot)
+    if model.name == "so101":
+        from .so101 import so101_links
+
+        links, tip = so101_links(worlds)  # one design: its masses vary a little, its dimensions do not
+        links["mass"] *= 1.0 + column * rng.uniform(-0.10, 0.10, shape)
+        links["inertia"] *= (links["mass"] / so101_links(1)[0]["mass"])[..., None, None]
+        add_tool_mass(links, tip, np.where(rng.random(worlds) < 0.5, rng.uniform(0.0, 0.1, worlds), 0.0) * per_robot)
+    else:
+        lengths = LENGTHS * (1.0 + column * rng.uniform(-0.15, 0.15, shape))
+        masses = MASSES * (1.0 + column * rng.uniform(-0.20, 0.20, shape))
+        side = TOOL_SIDE_OFFSET * (1.0 + per_robot * rng.uniform(-0.5, 0.5, worlds))
+        links, tip = _links(lengths, masses, side)
+        add_tool_mass(links, tip, np.where(rng.random(worlds) < 0.5, rng.uniform(0.0, 0.15, worlds), 0.0) * per_robot)
     links["gear_loss"] = np.where(rng.random(shape) < 0.6, rng.uniform(0.0, 0.25, shape), 0.0) * column
     links["bearing_loss"] = np.where(rng.random(shape) < 0.6, rng.uniform(0.0, 0.15, shape), 0.0) * column
-    links["compliance"] = np.where(rng.random(shape) < 0.7, rng.uniform(0.0, 1.0, shape), 0.0) * column * BEND_AT_RATED / NOMINAL_TORQUES
-    joints = sample_joint_defects(rng, worlds, JOINTS, NOMINAL_TORQUES, LIMITS, severity=severity,
-                                  friction_probability=friction_probability, friction_scale=FRICTION_SCALE)
+    links["compliance"] = (np.where(rng.random(shape) < 0.7, rng.uniform(0.0, 1.0, shape), 0.0) * column
+                           * model.bend_at_rated / model.torques)
+    joints = sample_joint_defects(rng, worlds, JOINTS, model.torques, model.limits, severity=severity,
+                                  friction_probability=friction_probability, friction_scale=model.friction_scale)
     joints["enc_bias"] *= 0.1  # homed: +-2 mrad left
-    joints["no_load_speed"] = rng.uniform(4.0, 10.0, shape)  # geared hobby motors; a property, not a defect
+    joints["no_load_speed"] = rng.uniform(*model.no_load_speed, shape)  # a property of the motor, not a defect
     return links, joints, tip
 
 
 def sample_arm3d_change(rng: np.random.Generator, links: np.ndarray, joints: np.ndarray, tip: np.ndarray, *,
-                        severity: float | np.ndarray = 1.0) -> tuple[np.ndarray, np.ndarray]:
+                        severity: float | np.ndarray = 1.0, model: ArmModel = DESKTOP) -> tuple[np.ndarray, np.ndarray]:
     """The same robots after something changed: a payload picked up, a motor fading, a joint fouling."""
 
     worlds = links.shape[0]
@@ -144,7 +187,8 @@ def sample_arm3d_change(rng: np.random.Generator, links: np.ndarray, joints: np.
     shape = (worlds, JOINTS)
     fading = np.where(rng.random(shape) < 0.3, rng.uniform(0.0, 0.4, shape), 0.0) * column
     changed_joints["torque_scale"] = joints["torque_scale"] * (1.0 - fading)
-    changed_joints["coulomb"] = joints["coulomb"] + np.where(rng.random(shape) < 0.3, rng.uniform(0.0, 0.2, shape), 0.0) * column * FRICTION_SCALE
+    changed_joints["coulomb"] = (joints["coulomb"] + np.where(rng.random(shape) < 0.3, rng.uniform(0.0, 0.2, shape), 0.0)
+                                 * column * model.friction_scale)
     return changed_links, changed_joints
 
 
@@ -243,6 +287,31 @@ def arm3d_inverse(pose: Tensor, joint_pos: Tensor, tip: Tensor) -> Tensor:
             shoulder = torch.atan2(reach, height) - torch.atan2(lower * torch.sin(elbow), upper + lower * torch.cos(elbow))
             solutions.append(torch.stack((yaw, shoulder, elbow, pitch - shoulder - elbow, roll), dim=1))
     return torch.remainder(torch.stack(solutions, dim=1) + torch.pi, 2.0 * torch.pi) - torch.pi
+
+
+def numeric_inverse(pose: Tensor, seed: Tensor, joint_pos: Tensor, axis: Tensor, tip: Tensor, *,
+                    iterations: int = 5, damping: float = 0.01) -> Tensor:
+    """Joint angles [W, n] that put the tool at `pose` [W, 7], by damped least squares from `seed`; any layout.
+
+    The residual is the tool point (m), its direction and the roll joint; the Jacobian is by finite differences.
+    """
+
+    q = seed.clone()
+    n = q.shape[1]
+
+    def residual(angles: Tensor) -> Tensor:
+        point, direction = arm3d_tool(angles, joint_pos, axis, tip)
+        return torch.cat((pose[:, :3] - point, 0.1 * (pose[:, 3:6] - direction), 0.1 * (pose[:, 6:] - angles[:, -1:])), dim=1)
+
+    eye = torch.eye(7, dtype=q.dtype, device=q.device)
+    for _ in range(iterations):
+        r = residual(q)
+        step = 1e-4
+        jacobian = torch.stack([(r - residual(q + step * torch.nn.functional.one_hot(torch.tensor(k), n).to(q))) / step
+                                for k in range(n)], dim=2)  # d(pose - tool)/dq, negated
+        solve = torch.linalg.solve(jacobian @ jacobian.transpose(1, 2) + damping**2 * eye, r[..., None])
+        q = q + (jacobian.transpose(1, 2) @ solve)[..., 0]
+    return q
 
 
 def arm3d_dynamics(q: Tensor, dq: Tensor, joint_pos: Tensor, axis: Tensor, com: Tensor, mass: Tensor, inertia: Tensor,
@@ -356,7 +425,10 @@ class Arm3DEnv(ChainEnv):
     def __init__(self, worlds: int, *, device: str = "cuda:0", seed: int = 0, severity: float = 1.0,
                  episode_ticks: int = 300, changes: bool = True, reward_tolerance: float = TOLERANCE,
                  still_weight: float = 1.0, roughness_weight: float = 4.0, mixed: bool = False, servo: bool = False,
-                 hold_weight: float = 0.0, stiffness: bool = False, accidents: float = 0.0, touches: float = 0.0) -> None:
+                 hold_weight: float = 0.0, stiffness: bool = False, accidents: float = 0.0, touches: float = 0.0,
+                 model: str = "desktop") -> None:
+        # Which arm: the desktop family (lengths, masses and tool vary per robot) or a specific design like the SO-101.
+        self.model = MODELS[model]
         self.worlds, self.limbs, self.n, self.limb_joints = worlds, 1, JOINTS, JOINTS
         # Mixed: every robot gets its own severity, from flawless to `severity`, so training on worn arms does not
         # cost precision on good ones.
@@ -381,6 +453,8 @@ class Arm3DEnv(ChainEnv):
         if self.contact_tasks:
             self.task_code = TASK_CODE + 3
             self.action_dim = self.action_dim + 1
+        if self.model.name == "so101":
+            self.task_code += 10  # an SO-101 network: evaluate it on SO-101s
         self.device, self.severity, self.episode_ticks, self.changes = device, severity, episode_ticks, changes
         self.reward_tolerance, self.still_weight, self.roughness_weight = reward_tolerance, still_weight, roughness_weight
         self.rng = np.random.default_rng([seed, 3000 + JOINTS])
@@ -388,8 +462,9 @@ class Arm3DEnv(ChainEnv):
         if self.torch_device.type == "cuda":
             wp.init()
             wp.set_stream(wp.stream_from_torch(torch.cuda.current_stream(self.torch_device)), device)
-        self.nominal_torques = NOMINAL_TORQUES
-        self._torque = torch.as_tensor(NOMINAL_TORQUES, dtype=torch.float32, device=self.torch_device)
+        self.nominal_torques = self.model.torques
+        self._torque = torch.as_tensor(self.model.torques, dtype=torch.float32, device=self.torch_device)
+        self._limits = torch.as_tensor(self.model.limits, dtype=torch.float32, device=self.torch_device)
         self.initial_std = [0.3 if servo else 0.5] * self.action_dim
         if self.contact_tasks:
             self.initial_std[-1] = 1.0  # the brake has to be tried hard enough to discover backing off
@@ -398,32 +473,33 @@ class Arm3DEnv(ChainEnv):
         self.privileged_dim = self.observation_dim + 2 * self.n + 7 + 12 * self.n + (5 if self.contact_tasks else 0)
 
     def _hidden(self, links: np.ndarray, joints: np.ndarray) -> Tensor:
-        return self._tensor(np.concatenate((joints["torque_scale"] / NOMINAL_TORQUES, joints["coulomb"] * 4.0,
+        return self._tensor(np.concatenate((joints["torque_scale"] / self.model.torques, joints["coulomb"] * 4.0,
                                             joints["half_gap"] * 50.0, joints["damping"] * 10.0, joints["delay_steps"] / 30.0,
                                             links["mass"], links["gear_loss"] * 4.0, links["bearing_loss"] * 7.0,
-                                            links["compliance"] * NOMINAL_TORQUES / BEND_AT_RATED,
+                                            links["compliance"] * self.model.torques / self.model.bend_at_rated,
                                             joints["no_load_speed"] / 10.0, joints["servo_gain"] / 25.0,
                                             joints["servo_damping"] * 50.0), axis=1))
 
     def _poses(self, links: np.ndarray, tip: np.ndarray) -> np.ndarray:
         """Joint configurations [worlds, n] in the goal span whose tool point clears the table."""
 
-        q = self.rng.uniform(-GOAL_SPAN, GOAL_SPAN, (self.worlds, self.n))
+        low, high = self.model.goal_low, self.model.goal_high
+        q = self.rng.uniform(low, high, (self.worlds, self.n))
         t = torch.as_tensor
         for _ in range(20):
             point, _ = arm3d_tool(t(q), t(links["joint_pos"]).double(), t(links["axis"]).double(), t(tip).double())
-            low = (point[:, 2] < TABLE_CLEARANCE).numpy()
-            if not low.any():
+            below = (point[:, 2] < TABLE_CLEARANCE).numpy()
+            if not below.any():
                 break
-            q[low] = self.rng.uniform(-GOAL_SPAN, GOAL_SPAN, (int(low.sum()), self.n))
+            q[below] = self.rng.uniform(low, high, (int(below.sum()), self.n))
         return q
 
     def reset(self) -> Tensor:
         severity = self.rng.uniform(0.0, self.severity, self.worlds) if self.mixed else self.severity
-        links, joints, tip = sample_arm3d_population(self.rng, self.worlds, severity=severity)
+        links, joints, tip = sample_arm3d_population(self.rng, self.worlds, severity=severity, model=self.model)
         if self.servo:
             sample_servos(self.rng, joints)
-        changed = sample_arm3d_change(self.rng, links, joints, tip, severity=severity)
+        changed = sample_arm3d_change(self.rng, links, joints, tip, severity=severity, model=self.model)
         ticks = self.episode_ticks
         change_tick = np.where(self.rng.random(self.worlds) < (0.5 if self.changes else 0.0),
                                self.rng.integers(20, ticks - 60, self.worlds), np.iinfo(np.int32).max)
@@ -441,7 +517,9 @@ class Arm3DEnv(ChainEnv):
         # The arm as its maker describes it: kinematics for the controller's own reckoning, and lengths as inputs.
         self._joint_pos, self._axis = self._tensor(links["joint_pos"]), self._tensor(links["axis"])
         self._tip_offset = self._tensor(tip)
-        self._geometry = self._tensor(np.concatenate((links["joint_pos"][:, 1:, 2], tip[:, 2:]), axis=1) / 0.25)
+        # Each link's length (joint to next joint, the last to the tool point); on the desktop layout its z offset.
+        self._geometry = self._tensor(np.concatenate((np.linalg.norm(links["joint_pos"][:, 1:], axis=2),
+                                                      np.linalg.norm(tip, axis=1, keepdims=True)), axis=1) / 0.25)
         # Goals are poses the rigid arm reaches at sampled joint angles; a bending arm must aim past them.
         self._goals = self._tensor(joint_goals)
         self._pose_goals = torch.stack([torch.cat((*arm3d_tool(g, self._joint_pos, self._axis, self._tip_offset),
@@ -531,8 +609,11 @@ class Arm3DEnv(ChainEnv):
         approach = point - direction * t(self.rng.uniform(0.03, 0.08, self.worlds))[:, None]
         self._approach_np = approach.numpy()
         pose = torch.cat((approach, direction, t(goal[:, -1:])), dim=1)
-        candidates = arm3d_inverse(pose, geometry[0], geometry[2])
-        limits = t(LIMITS) * 0.97
+        if self.model.closed_form:
+            candidates = arm3d_inverse(pose, geometry[0], geometry[2])
+        else:
+            candidates = numeric_inverse(pose, t(goal), geometry[0], geometry[1], geometry[2], iterations=30)[:, None]
+        limits = t(self.model.limits) * 0.97
         valid = ((candidates >= limits[:, 0]) & (candidates <= limits[:, 1])).all(dim=2)
         distance = torch.where(valid, (candidates - t(goal)[:, None]).abs().sum(dim=2), torch.inf)
         choice = candidates[torch.arange(self.worlds), distance.argmin(dim=1)]
@@ -591,9 +672,14 @@ class Arm3DEnv(ChainEnv):
 
         later = self._later()[:, 0]
         stale = self._solution_phase != later
-        if stale.any():
+        if stale.any() and not self.model.closed_form:
+            # Any other layout: the exact solution the goal was sampled from, as a proper IK solver would give.
+            self._solution = torch.where(stale[:, None], torch.where(later[:, None], self._goals[1], self._goals[0]),
+                                         self._solution)
+            self._solution_phase = later.clone()
+        elif stale.any():
             candidates = arm3d_inverse(self.goal(), self._joint_pos, self._tip_offset)
-            limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device) * 0.97
+            limits = self._limits * 0.97
             valid = ((candidates >= limits[:, 0]) & (candidates <= limits[:, 1])).all(dim=2)
             here = self.measured_q
             distance = torch.where(valid, (candidates - here[:, None]).abs().sum(dim=2), torch.inf)
@@ -602,11 +688,15 @@ class Arm3DEnv(ChainEnv):
             self._solution_phase = later.clone()
         if self.contact_tasks and (self._mode == TOUCH).any():
             # A sliding goal: follow its solution continuously from the previous one.
-            candidates = arm3d_inverse(self.goal(), self._joint_pos, self._tip_offset)
-            limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device) * 0.97
-            valid = ((candidates >= limits[:, 0]) & (candidates <= limits[:, 1])).all(dim=2)
-            distance = torch.where(valid, (candidates - self._solution[:, None]).abs().sum(dim=2), torch.inf)
-            nearest = candidates[torch.arange(self.worlds, device=self.torch_device), distance.argmin(dim=1)]
+            if self.model.closed_form:
+                candidates = arm3d_inverse(self.goal(), self._joint_pos, self._tip_offset)
+                limits = self._limits * 0.97
+                valid = ((candidates >= limits[:, 0]) & (candidates <= limits[:, 1])).all(dim=2)
+                distance = torch.where(valid, (candidates - self._solution[:, None]).abs().sum(dim=2), torch.inf)
+                nearest = candidates[torch.arange(self.worlds, device=self.torch_device), distance.argmin(dim=1)]
+            else:
+                nearest = numeric_inverse(self.goal(), self._solution, self._joint_pos, self._axis, self._tip_offset,
+                                          iterations=3)
             self._solution = torch.where((self._mode == TOUCH)[:, None], nearest, self._solution)
         return self._solution
 
@@ -663,7 +753,7 @@ class Arm3DEnv(ChainEnv):
         action = action.clamp(-1.0, 1.0)
         smooth = action if reference is None else reference.clamp(-1.0, 1.0)
         if self.servo:
-            limits = torch.as_tensor(LIMITS, dtype=torch.float32, device=self.torch_device)
+            limits = self._limits
             targets = self.joint_goal() + SERVO_REACH * action[:, :n]
             if self.contact_tasks:
                 holding = (1.5 * action[:, -1:]) >= HOLD
