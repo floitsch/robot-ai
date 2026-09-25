@@ -404,6 +404,7 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
     # With a KL target the step size follows the policy's measured drift instead of a schedule (as rsl_rl does): a
     # warm-started, precise policy is moved by any fixed rate that is large enough to make progress later on.
     adaptive_lr = learning_rate * 0.1 if target_kl else learning_rate  # grows once steps prove timid
+    best_score = -1.0
     for iteration in range(1, iterations + 1):
         for group in optimizer.param_groups:
             group["lr"] = adaptive_lr if target_kl else learning_rate * (1.0 - 0.9 * (iteration - 1) / iterations)
@@ -496,8 +497,20 @@ def train(*, recurrent: bool, output: Path, device: str, worlds: int, iterations
         if actor.insight is not None:
             record["insight_loss"] = insight_loss.item()
         if iteration % eval_every == 0 or iteration == iterations:
-            record["eval"] = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs, robot=robot, severity=severity)
+            worn = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs, robot=robot, severity=severity)
+            record["eval"] = worn
             torch.save(actor.state_dict(), output / "actor.pt")
+            score = worn["success"]
+            if severity > 0:
+                # PPO near a good policy can drift down; keep the best one, judged on flawless and on worn robots.
+                healthy = evaluate(actor, worlds=eval_worlds, device=device, limbs=limbs, robot=robot, severity=0.0)
+                record["eval_healthy"] = healthy
+                score = (score + healthy["success"]) / 2.0
+            if score > best_score:
+                best_score = score
+                (output / "best").mkdir(exist_ok=True)
+                torch.save(actor.state_dict(), output / "best" / "actor.pt")
+                record["best"] = True
         log.write(json.dumps(record) + "\n")
         log.flush()
         print(json.dumps(record), flush=True)
@@ -650,6 +663,8 @@ def main() -> None:
                      help="adapt the step size to keep each update's KL from the rollout policy near this (up to --learning-rate)")
     fit.add_argument("--hold-weight", type=float, default=0.0,
                      help="3D arms: L1 charge on every change of the commanded targets, so settled targets stay put")
+    fit.add_argument("--entropy", type=float, default=0.002,
+                     help="entropy bonus; 0 when fine-tuning a good policy, whose noise should shrink, not grow")
     fit.add_argument("--critic-warmup", type=int, default=0, help="with --initial: train only the critic for this many iterations")
     fit.add_argument("--initial-noise", type=float, default=0.3,
                      help="with --initial: exploration as a fraction of the task's initial noise level")
@@ -711,6 +726,7 @@ def main() -> None:
               pushes=args.pushes, limbs=args.limbs, per_limb=args.per_limb, message=args.message,
               severity=args.severity, initial=args.initial, minibatch=args.minibatch, severity_ramp=args.severity_ramp,
               critic_warmup=args.critic_warmup, initial_noise=args.initial_noise, target_kl=args.target_kl, hold_weight=args.hold_weight,
+              entropy=args.entropy,
               learning_rate=args.learning_rate,
               peek=args.peek, identity=args.identity, robot="" if args.robot == "planar" else args.robot,
               output=args.output, device=args.device, worlds=args.worlds,
